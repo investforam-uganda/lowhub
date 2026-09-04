@@ -159,6 +159,31 @@ app.get('/', (req, res) => {
   res.json({ ok: true, service: 'lowhub-backend', firebase: !!db });
 });
 
+// Visit this route in a browser (https://your-render-app.onrender.com/api/outbound-ip)
+// to see the exact IP address this server uses when it talks to MarzPay —
+// that's the IP to paste into MarzPay's dashboard whitelist. This calls an
+// external "what's my IP" service FROM the server, so the IP it reports is
+// this server's own outbound IP, not the visitor's.
+// NOTE: on Render's free/starter plans this outbound IP is not guaranteed
+// stable and can change after a redeploy or restart — if MarzPay keeps
+// rejecting requests after whitelisting this IP once, re-check this route
+// again after your next deploy, or look into Render's static outbound IP
+// add-on (https://render.com/docs/static-outbound-ip-addresses) for a
+// fixed IP that survives deploys.
+app.get('/api/outbound-ip', async (req, res) => {
+  try {
+    const ipRes = await fetch('https://api.ipify.org?format=json');
+    const ipData = await ipRes.json();
+    res.json({
+      ok: true,
+      outboundIp: ipData.ip,
+      note: 'This is the IP address this server uses to reach MarzPay. Whitelist it in your MarzPay dashboard. On Render free/starter plans this can change after a redeploy.'
+    });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: 'Could not determine outbound IP: ' + e.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // 1. AUTOMATIC PAYMENTS — MarzPay
 // ─────────────────────────────────────────────────────────────────────────
@@ -241,7 +266,15 @@ app.post('/api/payments/collect', async (req, res) => {
     }
 
     if (!marzRes.ok || (marzData.status !== true && marzData.status !== 'success' && !marzData.success)) {
-      const errMsg = marzData?.message || 'MarzPay declined the request.';
+      let errMsg = marzData?.message || 'MarzPay declined the request.';
+      // MarzPay rejects requests from IPs not on your account's whitelist
+      // with a message like "Access denied. Your IP address is not
+      // whitelisted." — surface a clearer, actionable version of that
+      // specific case so it doesn't look like a generic decline. Visit
+      // GET /api/outbound-ip on this server to get the exact IP to add.
+      if (/ip address.*not whitelisted|access denied/i.test(errMsg)) {
+        errMsg = `MarzPay rejected this request because this server's IP isn't whitelisted on your MarzPay account. Visit ${PUBLIC_BACKEND_URL || '<this server\'s URL>'}/api/outbound-ip to get the exact IP, then add it in your MarzPay dashboard.`;
+      }
       await paymentRef.update({ status: 'failed', failureReason: errMsg, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
       return res.status(400).json({ success: false, error: errMsg });
     }
