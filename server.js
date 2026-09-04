@@ -36,11 +36,10 @@
  *   3. Set these Environment Variables in the Render dashboard (never
  *      commit them to git):
  *
- *      FIREBASE_PROJECT_ID        e.g. lowhub-marketplace-ug
- *      FIREBASE_CLIENT_EMAIL      from your Firebase service account JSON
- *      FIREBASE_PRIVATE_KEY       from your Firebase service account JSON
- *                                  (paste with \n literal newlines — see
- *                                  note below)
+ *      FIREBASE_SERVICE_ACCOUNT   the ENTIRE contents of your Firebase
+ *                                  service-account JSON file, pasted as one
+ *                                  line (see "Getting the Firebase value"
+ *                                  below)
  *      MARZPAY_API_KEY            from your MarzPay dashboard
  *      MARZPAY_API_SECRET         from your MarzPay dashboard
  *      MARZPAY_BASE_URL           https://wallet.wearemarz.com/api/v1
@@ -56,13 +55,14 @@
  *      PORT                       Render sets this automatically, leave
  *                                  unset locally it defaults to 3000
  *
- *      Getting the Firebase values: Firebase Console → Project Settings →
- *      Service Accounts → Generate New Private Key. That JSON file has
- *      "project_id", "client_email", and "private_key" — copy those three
- *      values into the env vars above. FIREBASE_PRIVATE_KEY contains real
- *      newlines in the JSON; when pasting into Render's single-line env var
- *      box, replace each newline with the two characters \n — this file
- *      converts them back automatically (see initFirebaseAdmin below).
+ *      Getting the Firebase value: Firebase Console → Project Settings →
+ *      Service Accounts → Generate New Private Key. This downloads a JSON
+ *      file. Open it, select all, copy the whole thing (curly braces and
+ *      all), and paste it as the value of FIREBASE_SERVICE_ACCOUNT in
+ *      Render — Render's env var boxes accept multi-line paste fine, and
+ *      JSON.parse() handles the \n escapes inside it correctly with no
+ *      manual editing needed. Do NOT reformat, retype, or split it up —
+ *      paste the file's contents exactly as downloaded.
  *
  *   4. In admin-payments.html, set "Backend URL" to your Render service's
  *      public URL (the same as PUBLIC_BACKEND_URL above).
@@ -75,46 +75,44 @@ const admin = require('firebase-admin');
 const fetch = global.fetch || require('node-fetch');
 
 // ── Firebase Admin init ─────────────────────────────────────────────────
+// Uses a single FIREBASE_SERVICE_ACCOUNT env var holding the entire
+// service-account JSON as one string, parsed with JSON.parse(). This is
+// deliberately NOT split into separate FIREBASE_PROJECT_ID /
+// FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY env vars — that approach
+// requires manually converting the private key's real newlines to literal
+// \n sequences and back, and it only takes one dropped character or one
+// "helpful" editor reformat during paste to corrupt the PEM structure and
+// trigger "error:1E08010C:DECODER routines::unsupported" from OpenSSL.
+// JSON.parse() on the whole file avoids that entirely — it interprets the
+// \n escapes inside the JSON string correctly by construction, giving
+// Node the exact byte-for-byte key Firebase generated.
 function initFirebaseAdmin() {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
 
-  if (!projectId || !clientEmail || !privateKey) {
-    console.error('[startup] Missing FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY env vars.');
-    console.error('[startup] The server will start, but every Firebase-dependent route will fail until these are set in Render.');
+  if (!raw) {
+    console.error('[startup] Missing FIREBASE_SERVICE_ACCOUNT env var.');
+    console.error('[startup] The server will start, but every Firebase-dependent route will fail until this is set in Render.');
     return null;
   }
 
-  // Normalize the private key defensively. A key pasted into a single-line
-  // env var box can pick up several forms of corruption that Firestore
-  // (REST-based) tolerates but gRPC's credential decoder (used by
-  // admin.messaging()) does not — which is why "firebase: true" on the
-  // health check can still be followed by
-  // "error:1E08010C:DECODER routines::unsupported" only on push sends.
-  privateKey = privateKey.trim();
-  // Strip a single pair of wrapping quotes, if the whole value got quoted
-  // when pasted (e.g. from a JSON file, quotes and all).
-  if (
-    (privateKey.startsWith('"') && privateKey.endsWith('"')) ||
-    (privateKey.startsWith("'") && privateKey.endsWith("'"))
-  ) {
-    privateKey = privateKey.slice(1, -1);
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch (e) {
+    console.error('[startup] FIREBASE_SERVICE_ACCOUNT is not valid JSON:', e.message);
+    console.error('[startup] Paste the ENTIRE contents of your downloaded service-account JSON file as-is, as one line, into this env var.');
+    return null;
   }
-  // Render env vars are single-line, so the private key's real newlines are
-  // typically pasted as the literal two-character sequence \n — convert back.
-  privateKey = privateKey.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
-  // Normalize any real \r\n (e.g. pasted via a Windows clipboard) to \n.
-  privateKey = privateKey.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  const looksValid = privateKey.includes('-----BEGIN PRIVATE KEY-----') && privateKey.includes('-----END PRIVATE KEY-----');
-  console.log(`[startup] FIREBASE_PRIVATE_KEY: length=${privateKey.length}, hasBeginMarker=${privateKey.includes('-----BEGIN')}, hasEndMarker=${privateKey.includes('-----END')}, lineCount=${privateKey.split('\n').length}`);
-  if (!looksValid) {
-    console.error('[startup] FIREBASE_PRIVATE_KEY does not look like a valid PEM key (missing BEGIN/END markers) even after normalization. Re-copy it from a freshly downloaded Firebase service-account JSON file.');
+  if (!serviceAccount.project_id || !serviceAccount.client_email || !serviceAccount.private_key) {
+    console.error('[startup] FIREBASE_SERVICE_ACCOUNT JSON is missing project_id, client_email, or private_key.');
+    return null;
   }
+
+  console.log(`[startup] FIREBASE_SERVICE_ACCOUNT parsed OK — project_id=${serviceAccount.project_id}, client_email=${serviceAccount.client_email}`);
 
   admin.initializeApp({
-    credential: admin.credential.cert({ projectId, clientEmail, privateKey })
+    credential: admin.credential.cert(serviceAccount)
   });
   return admin.firestore();
 }
@@ -411,11 +409,9 @@ async function processPendingPush() {
     }
   } catch (e) {
     if (e.message && e.message.includes('DECODER routines::unsupported')) {
-      console.error('[push] queue processing error: gRPC could not decode FIREBASE_PRIVATE_KEY.');
-      console.error('[push] This means the key string Render has does not parse as a valid PEM private key.');
-      console.error('[push] Re-download the service account JSON from Firebase Console > Project Settings > Service Accounts,');
-      console.error('[push] copy only the private_key value (including the BEGIN/END lines) with literal \\n sequences,');
-      console.error('[push] and paste it into Render as a single line with no extra quotes.');
+      console.error('[push] queue processing error: gRPC could not decode the service account private key.');
+      console.error('[push] Re-download a fresh service account JSON from Firebase Console > Project Settings > Service Accounts,');
+      console.error('[push] then paste its ENTIRE contents (unmodified) as the value of FIREBASE_SERVICE_ACCOUNT in Render.');
     } else {
       console.error('[push] queue processing error:', e.message);
     }
