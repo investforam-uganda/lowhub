@@ -86,9 +86,32 @@ function initFirebaseAdmin() {
     return null;
   }
 
+  // Normalize the private key defensively. A key pasted into a single-line
+  // env var box can pick up several forms of corruption that Firestore
+  // (REST-based) tolerates but gRPC's credential decoder (used by
+  // admin.messaging()) does not — which is why "firebase: true" on the
+  // health check can still be followed by
+  // "error:1E08010C:DECODER routines::unsupported" only on push sends.
+  privateKey = privateKey.trim();
+  // Strip a single pair of wrapping quotes, if the whole value got quoted
+  // when pasted (e.g. from a JSON file, quotes and all).
+  if (
+    (privateKey.startsWith('"') && privateKey.endsWith('"')) ||
+    (privateKey.startsWith("'") && privateKey.endsWith("'"))
+  ) {
+    privateKey = privateKey.slice(1, -1);
+  }
   // Render env vars are single-line, so the private key's real newlines are
   // typically pasted as the literal two-character sequence \n — convert back.
-  privateKey = privateKey.replace(/\\n/g, '\n');
+  privateKey = privateKey.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+  // Normalize any real \r\n (e.g. pasted via a Windows clipboard) to \n.
+  privateKey = privateKey.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  const looksValid = privateKey.includes('-----BEGIN PRIVATE KEY-----') && privateKey.includes('-----END PRIVATE KEY-----');
+  console.log(`[startup] FIREBASE_PRIVATE_KEY: length=${privateKey.length}, hasBeginMarker=${privateKey.includes('-----BEGIN')}, hasEndMarker=${privateKey.includes('-----END')}, lineCount=${privateKey.split('\n').length}`);
+  if (!looksValid) {
+    console.error('[startup] FIREBASE_PRIVATE_KEY does not look like a valid PEM key (missing BEGIN/END markers) even after normalization. Re-copy it from a freshly downloaded Firebase service-account JSON file.');
+  }
 
   admin.initializeApp({
     credential: admin.credential.cert({ projectId, clientEmail, privateKey })
@@ -387,7 +410,15 @@ async function processPendingPush() {
       }
     }
   } catch (e) {
-    console.error('[push] queue processing error:', e.message);
+    if (e.message && e.message.includes('DECODER routines::unsupported')) {
+      console.error('[push] queue processing error: gRPC could not decode FIREBASE_PRIVATE_KEY.');
+      console.error('[push] This means the key string Render has does not parse as a valid PEM private key.');
+      console.error('[push] Re-download the service account JSON from Firebase Console > Project Settings > Service Accounts,');
+      console.error('[push] copy only the private_key value (including the BEGIN/END lines) with literal \\n sequences,');
+      console.error('[push] and paste it into Render as a single line with no extra quotes.');
+    } else {
+      console.error('[push] queue processing error:', e.message);
+    }
   }
 }
 
