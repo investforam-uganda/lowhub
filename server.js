@@ -168,17 +168,36 @@ app.get('/', (req, res) => {
 app.post('/api/payments/collect', async (req, res) => {
   if (!requireDb(res)) return;
   try {
-    const { userId, userEmail, userName, phone, amount, planKey, planName, planDays, reference } = req.body || {};
+    const {
+      userId, userEmail, userName, phone, amount, reference,
+      // Premium-plan fields (purpose: 'premium', the default — kept
+      // backward compatible with the original premium-only shape).
+      planKey, planName, planDays,
+      // Deal-submission fields (purpose: 'deal'). dealPayload carries
+      // everything submitDeal()/startDealAutomaticPayment() in profile.html
+      // needs to create the live deal on success — selected ads, heading,
+      // content, discount label, duration — since this collect call is the
+      // only place that data exists before payment confirms.
+      purpose, dealPayload
+    } = req.body || {};
 
-    if (!userId || !phone || !amount || !planKey) {
+    const isDeal = purpose === 'deal';
+    // planKey doubles as "what are we paying for" for premium; for deals we
+    // just need an identifying label, so fall back to a fixed one.
+    const itemKey = isDeal ? 'deal' : planKey;
+
+    if (!userId || !phone || !amount || (!isDeal && !planKey)) {
       return res.status(400).json({ success: false, error: 'Missing required fields (userId, phone, amount, planKey).' });
+    }
+    if (isDeal && (!dealPayload || !Array.isArray(dealPayload.adIds) || !dealPayload.adIds.length)) {
+      return res.status(400).json({ success: false, error: 'Missing deal details (selected ads).' });
     }
     if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) {
       return res.status(500).json({ success: false, error: 'Automatic payments are not configured on the server yet (missing MarzPay credentials).' });
     }
 
     const normalizedPhone = normalizePhone(phone);
-    const ref = reference || `LH-${planKey}-${Date.now()}`;
+    const ref = reference || `LH-${itemKey}-${Date.now()}`;
     const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     // Create the Firestore tracking doc FIRST (status: pending) so the
@@ -186,8 +205,11 @@ app.post('/api/payments/collect', async (req, res) => {
     const paymentRef = db.collection('autoPayments').doc();
     await paymentRef.set({
       userId, userEmail: userEmail || '', userName: userName || '',
-      phone: normalizedPhone, amount, planKey, planName: planName || '',
-      planDays: planDays || null, reference: ref,
+      phone: normalizedPhone, amount, reference: ref,
+      purpose: isDeal ? 'deal' : 'premium',
+      planKey: planKey || null, planName: planName || '',
+      planDays: planDays || null,
+      dealPayload: isDeal ? dealPayload : null,
       status: 'pending',
       provider: 'marzpay',
       marzpayTransactionId: null,
@@ -207,7 +229,7 @@ app.post('/api/payments/collect', async (req, res) => {
           phone_number: normalizedPhone,
           amount: amount,
           reference: ref,
-          description: `LowHub ${planName || planKey} plan`,
+          description: isDeal ? `LowHub deal submission (${dealPayload.adIds.length} ad(s))` : `LowHub ${planName || planKey} plan`,
           ...(callbackUrl ? { callback_url: callbackUrl } : {})
         })
       });
@@ -301,7 +323,15 @@ async function applyPaymentStatus(marzpayTxId, status, rawPayload) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       rawWebhook: JSON.stringify(rawPayload).slice(0, 3000)
     });
-    await activatePremiumPlan(data);
+    // Automatic payments skip admin review entirely and apply their result
+    // immediately — that's the whole point of "automatic" mode. Manual
+    // payments (screenshot upload) always still go through admin approval
+    // in admin.html / admin-payments.html, regardless of this branch.
+    if (data.purpose === 'deal') {
+      await activateDealFromPayment(data);
+    } else {
+      await activatePremiumPlan(data);
+    }
   } else if (status === 'failed') {
     await doc.ref.update({
       status: 'failed',
@@ -360,8 +390,90 @@ async function activatePremiumPlan(payment) {
   });
 }
 
-// Backstop poller: checks MarzPay's own status endpoint a few times in case
-// the webhook never arrives. Stops once resolved or after ~2.5 minutes.
+// Makes a deal submission live in Firestore once its automatic payment is
+// confirmed — mirrors the shape admin.html's approveDealRequest() writes
+// (deals/{id} per selected ad + isDeal/dealLabel on the listing), so an
+// auto-approved deal is indistinguishable from a manually-approved one
+// once it's live. Also writes a dealRequests record (status: 'approved',
+// source: 'marzpay_automatic') purely so it still shows up in the admin's
+// Deal Requests list for their records — no action needed from them.
+async function activateDealFromPayment(payment) {
+  const d = payment.dealPayload || {};
+  const adIds = Array.isArray(d.adIds) ? d.adIds : [];
+  const selectedAds = Array.isArray(d.selectedAds) ? d.selectedAds : [];
+  if (!adIds.length) {
+    console.warn('[deal] activateDealFromPayment called with no adIds — skipping', payment);
+    return;
+  }
+
+  const duration = d.duration || 1;
+  const startDate = new Date();
+  const endDate = new Date(startDate.getTime() + duration * 86400000);
+
+  // Record it in dealRequests too (already 'approved') so admin still sees
+  // it for their records, exactly like the note in admin-payments.html says
+  // automatic payments do ("they'll still show here for your records").
+  const dealReqRef = db.collection('dealRequests').doc();
+  const batch = db.batch();
+  batch.set(dealReqRef, {
+    userId: payment.userId,
+    userName: payment.userName || '',
+    userEmail: payment.userEmail || '',
+    selectedAds, adIds, duration,
+    heading: d.heading || 'Deal',
+    content: d.content || '',
+    discountLabel: d.discountLabel || '',
+    paymentMethod: 'marzpay',
+    totalAmount: payment.amount,
+    status: 'approved',
+    source: 'marzpay_automatic',
+    submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+    approvedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  for (const adId of adIds) {
+    const ad = selectedAds.find(a => a.id === adId) || {};
+    const dealRef = db.collection('deals').doc();
+    batch.set(dealRef, {
+      listingId: adId,
+      title: d.heading || 'Deal',
+      discountLabel: d.discountLabel || '',
+      content: d.content || '',
+      userDealRequestId: dealReqRef.id,
+      userId: payment.userId,
+      active: true,
+      expiresAt: endDate.toISOString(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    batch.update(db.collection('listings').doc(adId), {
+      isDeal: true,
+      dealLabel: d.discountLabel || d.heading || 'Deal'
+    });
+  }
+
+  await batch.commit();
+
+  await db.collection('userNotifications').add({
+    userId: payment.userId,
+    type: 'dealApproved',
+    title: 'Payment Successful',
+    message: `Your deal "${d.heading || 'Deal'}" is now live! (${adIds.length} ad(s) · ${duration} day(s))`,
+    link: 'my-ads.html',
+    read: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  await db.collection('pendingPush').add({
+    userId: payment.userId,
+    title: 'Deal Live!',
+    body: `Your deal "${d.heading || 'Deal'}" is now live on LowHub!`,
+    link: '/my-ads.html',
+    sent: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+
 async function pollMarzpayStatus(paymentDocId, txId) {
   const maxAttempts = 25;
   for (let i = 0; i < maxAttempts; i++) {
@@ -476,16 +588,42 @@ function checkAdminToken(req, res) {
 // config. NOTE: MarzPay keys themselves should stay in Render env vars, not
 // Firestore — this endpoint only stores the *non-secret* settings (mode,
 // backend URL) that the browser is allowed to read back via Firestore.
+// admin-payments.html calls this once per location (Premium plans / Deal
+// submissions) so each can independently be manual or automatic, with its
+// own manual-mode instructions. `location` defaults to 'premium' so an
+// older frontend build calling this without it still behaves the same as
+// before (single global setting, now just stored at .premium).
 app.post('/api/admin/payment-settings', async (req, res) => {
   if (!requireDb(res)) return;
   if (!checkAdminToken(req, res)) return;
   try {
-    const { mode, backendUrl } = req.body || {};
+    const { mode, backendUrl, instructions, location } = req.body || {};
+    const loc = location === 'deals' ? 'deals' : 'premium';
     if (!['manual', 'automatic'].includes(mode)) {
       return res.status(400).json({ success: false, error: "mode must be 'manual' or 'automatic'." });
     }
+    // instructions is optional: { mtn:{title,body}, airtel:{...}, bank:{...} }.
+    // Any field the admin leaves blank is dropped here so the frontend's
+    // own DEFAULT_PAYMENT_INSTRUCTIONS fallback applies for it — we never
+    // store an empty string that would display as blank instead of the
+    // default text.
+    let cleanInstructions;
+    if (instructions && typeof instructions === 'object') {
+      cleanInstructions = {};
+      for (const method of ['mtn', 'airtel', 'bank']) {
+        const src = instructions[method];
+        if (!src) continue;
+        const entry = {};
+        if (src.title && String(src.title).trim()) entry.title = String(src.title).trim();
+        if (src.body && String(src.body).trim()) entry.body = String(src.body).trim();
+        if (Object.keys(entry).length) cleanInstructions[method] = entry;
+      }
+    }
     await db.collection('siteConfig').doc('paymentSettings').set({
-      mode, backendUrl: backendUrl || '',
+      [loc]: {
+        mode, backendUrl: backendUrl || '',
+        ...(cleanInstructions ? { instructions: cleanInstructions } : {})
+      },
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
     res.json({ success: true });
