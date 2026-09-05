@@ -83,6 +83,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const fetch = global.fetch || require('node-fetch');
+const crypto = require('crypto');
 
 // ── Firebase Admin init ─────────────────────────────────────────────────
 // Uses a single FIREBASE_SERVICE_ACCOUNT env var holding the entire
@@ -689,13 +690,19 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
     if (!isValidUgandaPhone(normalizedPhone)) {
       return res.status(400).json({ success: false, error: 'Please enter a valid mobile money number, e.g. 0755 123456.' });
     }
-    const ref = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
+    // MarzPay requires `reference` to be a UUID (its own validation message
+    // literally spells out the expected format) — LH-ORDER-... was being
+    // rejected on every single request regardless of phone number. Keep the
+    // human-readable order-linked string too (as internalRef) since that's
+    // useful in our own logs/records, but send MarzPay the UUID it demands.
+    const ref = crypto.randomUUID();
+    const internalRef = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
     const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     const paymentRef = db.collection('autoPayments').doc();
     await paymentRef.set({
       userId: uid, userEmail: req.authEmail || '', userName: order.buyerSnapshot?.name || '',
-      phone: normalizedPhone, amount: order.total, reference: ref,
+      phone: normalizedPhone, amount: order.total, reference: ref, internalRef,
       purpose: 'order', orderId, orderNumber: order.orderNumber,
       planKey: null, planName: null, planDays: null, dealPayload: null,
       status: 'pending', provider: 'marzpay', marzpayTransactionId: null,
@@ -703,8 +710,12 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    let localPhone = normalizedPhone;
-    if (localPhone.startsWith('256')) localPhone = '0' + localPhone.slice(3);
+    // MarzPay's own validation error explicitly asks for the phone number
+    // WITH country code (e.g. +256712345678) — this was converting it back
+    // to local format (0755...) right before sending, which is exactly why
+    // MarzPay rejected every request with "check your input" regardless of
+    // what the user typed. Send the +country-code form MarzPay asks for.
+    const marzPhone = '+' + normalizedPhone;
 
     let marzRes, marzData;
     try {
@@ -712,7 +723,7 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': marzpayAuthHeader() },
         body: JSON.stringify({
-          phone_number: localPhone, amount: order.total, country: 'UG', reference: ref,
+          phone_number: marzPhone, amount: order.total, country: 'UG', reference: ref,
           description: `LowHub order ${order.orderNumber}`,
           ...(callbackUrl ? { callback_url: callbackUrl } : {})
         })
@@ -830,7 +841,14 @@ app.post('/api/payments/collect', async (req, res) => {
     if (!isValidUgandaPhone(normalizedPhone)) {
       return res.status(400).json({ success: false, error: 'Please enter a valid mobile money number, e.g. 0755 123456.' });
     }
-    const ref = reference || `LH-${itemKey}-${Date.now()}`;
+    // MarzPay requires `reference` to be a UUID (confirmed directly from its
+    // own VALIDATION_ERROR response) — LH-{itemKey}-{timestamp} was being
+    // rejected on every request. A caller-supplied `reference` is still
+    // honored if present, but internalRef always keeps the readable label.
+    const internalRef = reference || `LH-${itemKey}-${Date.now()}`;
+    const ref = (reference && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference))
+      ? reference
+      : crypto.randomUUID();
     const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     // Create the Firestore tracking doc FIRST (status: pending) so the
@@ -838,7 +856,7 @@ app.post('/api/payments/collect', async (req, res) => {
     const paymentRef = db.collection('autoPayments').doc();
     await paymentRef.set({
       userId, userEmail: userEmail || '', userName: userName || '',
-      phone: normalizedPhone, amount, reference: ref,
+      phone: normalizedPhone, amount, reference: ref, internalRef,
       purpose: isDeal ? 'deal' : 'premium',
       planKey: planKey || null, planName: planName || '',
       planDays: planDays || null,
@@ -850,18 +868,11 @@ app.post('/api/payments/collect', async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // NOTE ON PHONE FORMAT: MarzPay's own published SDK examples disagree
-    // with each other — their PHP SDK example uses local format with a
-    // country field ('0759983853' + country:'UG'), their .NET SDK example
-    // uses '+2567...', and their own Python SDK example uses '256759...'
-    // with no country field. We're following the PHP SDK's example here
-    // (local format + country) since it's the most complete of the three,
-    // but this hasn't been confirmed against MarzPay's actual raw HTTP API
-    // docs — if collections keep failing, log/inspect rawResponse below
-    // (now stored in Firestore) to see MarzPay's exact validation message
-    // rather than guessing at another format.
-    let localPhone = normalizedPhone;
-    if (localPhone.startsWith('256')) localPhone = '0' + localPhone.slice(3);
+    // CONFIRMED from MarzPay's own VALIDATION_ERROR response (see server
+    // logs): it wants the phone number WITH country code, e.g.
+    // +256712345678 — not local format. The local-format conversion below
+    // was the actual cause of every "check your input" rejection.
+    const marzPhone = '+' + normalizedPhone;
 
     let marzRes, marzData;
     try {
@@ -872,7 +883,7 @@ app.post('/api/payments/collect', async (req, res) => {
           'Authorization': marzpayAuthHeader()
         },
         body: JSON.stringify({
-          phone_number: localPhone,
+          phone_number: marzPhone,
           amount: amount,
           country: 'UG',
           reference: ref,
