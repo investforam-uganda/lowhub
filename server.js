@@ -28,6 +28,16 @@
  *      vs manual toggle and backend/API config without putting secrets in
  *      Firestore in plaintext where every logged-in user can read them.
  *
+ *   4. MARKETPLACE ORDERS (NEW — LowHub Order/Delivery upgrade)
+ *      POST /api/orders/create, /api/orders/:id/pay, /api/orders/:id/negotiate,
+ *      /api/orders/:id/status, /api/orders/:id/verify-pickup. These require
+ *      no new env vars beyond what's already listed below — they reuse
+ *      FIREBASE_SERVICE_ACCOUNT (for admin.auth().verifyIdToken and
+ *      Firestore transactions) and the existing MarzPay + PUBLIC_BACKEND_URL
+ *      vars (order payments reuse the same MarzPay collection flow as
+ *      premium payments). See IMPLEMENTATION_PLAN.md and
+ *      ORDERS_DATA_MODEL.md at the project root for the full design.
+ *
  * ── Deploying on Render ─────────────────────────────────────────────────
  *   1. Push this file (+ package.json) to a repo, or create a new Render
  *      Web Service pointing at a repo containing it.
@@ -142,6 +152,31 @@ function requireDb(res) {
   return true;
 }
 
+// ── Auth verification middleware (NEW — orders endpoints only) ───────────
+// The original premium-payment endpoints (/api/payments/collect etc.) trust
+// a client-supplied userId, carried forward unchanged here since touching
+// that flow was out of scope for this upgrade. The new order endpoints are
+// new surface area handling real money against real inventory, so they
+// verify the caller's Firebase ID token server-side and DERIVE userId from
+// it — the request body's userId, if present, is never trusted (spec §47:
+// "Do not trust a user-provided userId. The backend should derive/verify
+// the authenticated user.").
+async function requireAuth(req, res, next) {
+  if (!db) return res.status(500).json({ success: false, error: 'Server is missing Firebase configuration.' });
+  const header = req.headers['authorization'] || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ success: false, error: 'Missing Authorization bearer token.' });
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.authUid = decoded.uid;
+    req.authEmail = decoded.email || null;
+    next();
+  } catch (e) {
+    console.error('[auth] token verification failed:', e.message);
+    return res.status(401).json({ success: false, error: 'Invalid or expired session. Please sign in again.' });
+  }
+}
+
 // Normalizes a Ugandan phone number to the 2567XXXXXXXX format MarzPay
 // expects, accepting common local formats (0745..., 745..., +256745...).
 function normalizePhone(raw) {
@@ -157,6 +192,583 @@ function normalizePhone(raw) {
 // ─────────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'lowhub-backend', firebase: !!db });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// 0. ORDERS — creation, pricing, stock reservation, negotiation, status
+// ─────────────────────────────────────────────────────────────────────────
+// This section is entirely NEW (marketplace/order upgrade). It sits ahead
+// of the pre-existing payments section both physically and in trust: order
+// creation is the one place price/fee/total are computed, and every later
+// step (payment, status transitions) reads from what gets written here —
+// never from client-supplied numbers.
+
+const ORDER_STATUS_TRANSITIONS = {
+  pending: ['awaiting_delivery_fee', 'awaiting_payment', 'cancelled', 'expired'],
+  awaiting_delivery_fee: ['awaiting_payment', 'cancelled', 'expired'],
+  awaiting_payment: ['payment_pending', 'cancelled', 'expired'],
+  payment_pending: ['paid', 'payment_failed'],
+  paid: ['seller_confirmation', 'cancelled', 'disputed'],
+  seller_confirmation: ['confirmed', 'rejected'],
+  confirmed: ['processing', 'cancelled', 'disputed'],
+  processing: ['ready_for_dispatch', 'cancelled', 'disputed'],
+  ready_for_dispatch: ['handed_to_lowhub', 'out_for_delivery', 'ready_for_pickup', 'disputed'],
+  handed_to_lowhub: ['out_for_delivery', 'disputed'],
+  out_for_delivery: ['delivered', 'disputed'],
+  ready_for_pickup: ['picked_up', 'disputed'],
+  picked_up: ['completed', 'return_requested'],
+  delivered: ['completed', 'return_requested', 'disputed'],
+  completed: ['return_requested'],
+  return_requested: ['returned', 'rejected'],
+  returned: [], cancelled: [], rejected: [], expired: [],
+  payment_failed: ['awaiting_payment', 'cancelled'],
+  disputed: ['confirmed', 'processing', 'cancelled', 'returned']
+};
+function canTransitionOrderStatus(from, to) {
+  if (from === to) return false;
+  const allowed = ORDER_STATUS_TRANSITIONS[from];
+  return Array.isArray(allowed) && allowed.includes(to);
+}
+
+async function generateOrderNumber() {
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+  const counterRef = db.collection('counters').doc(`orderSeq-${dateStr}`);
+  const seq = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef);
+    const current = snap.exists ? (snap.data().value || 0) : 0;
+    const next = current + 1;
+    tx.set(counterRef, { value: next, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return next;
+  });
+  return `LH-${dateStr}-${String(seq).padStart(6, '0')}`;
+}
+
+async function logOrderEvent(orderId, { type, actorId, actorRole, metadata }) {
+  await db.collection('orders').doc(orderId).collection('events').add({
+    type, actorId: actorId || null, actorRole: actorRole || 'system',
+    metadata: metadata || {}, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+// POST /api/orders/create
+// Body: { idempotencyKey, listingId, quantity, deliveryMethod, pickupStationId?,
+//         deliveryZoneId?, deliveryAddress? }
+// Every price/fee value is computed HERE from live Firestore data — the
+// request body never supplies price, subtotal, deliveryFee, or total
+// (spec §38). Stock is reserved via a Firestore transaction so two buyers
+// can't both win the last unit (spec §5, §20).
+app.post('/api/orders/create', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { idempotencyKey, listingId, quantity, deliveryMethod, pickupStationId, deliveryZoneId, deliveryAddress } = req.body || {};
+    const buyerId = req.authUid;
+
+    if (!listingId || !quantity || quantity < 1 || !deliveryMethod) {
+      return res.status(400).json({ success: false, error: 'Missing required order fields.' });
+    }
+    if (!['seller_delivery', 'pickup_station', 'lowhub_delivery'].includes(deliveryMethod)) {
+      return res.status(400).json({ success: false, error: 'Invalid delivery method.' });
+    }
+
+    // Idempotency: if this exact key already produced an order, return it
+    // instead of creating a second one (spec §39 — double-tap protection).
+    if (idempotencyKey) {
+      const existing = await db.collection('orders').where('idempotencyKey', '==', idempotencyKey).limit(1).get();
+      if (!existing.empty) {
+        return res.json({ success: true, orderId: existing.docs[0].id, orderNumber: existing.docs[0].data().orderNumber, reused: true });
+      }
+    }
+
+    const listingRef = db.collection('listings').doc(listingId);
+    const buyerRef = db.collection('users').doc(buyerId);
+
+    // ── Transaction: validate + reserve stock + build the order atomically ──
+    const result = await db.runTransaction(async (tx) => {
+      const listingSnap = await tx.get(listingRef);
+      if (!listingSnap.exists) throw new UserFacingError('This product could not be found.');
+      const listing = listingSnap.data();
+
+      if (listing.status !== 'approved') throw new UserFacingError('This listing is not currently available.');
+      if (buyerId === listing.userId) throw new UserFacingError("You can't order your own listing.");
+
+      let acceptOrders = listing.acceptOrders;
+      if (acceptOrders === undefined || acceptOrders === null) {
+        const cfgSnap = await tx.get(db.collection('siteConfig').doc('orderSettings'));
+        acceptOrders = cfgSnap.exists ? !!cfgSnap.data().defaultAcceptOrders : false;
+      }
+      if (!acceptOrders) throw new UserFacingError('This seller has not enabled LowHub orders for this listing.');
+
+      const sellerSnap = await tx.get(db.collection('users').doc(listing.userId));
+      const seller = sellerSnap.exists ? sellerSnap.data() : {};
+      if (seller.suspended === true) throw new UserFacingError('This seller is currently unavailable.');
+
+      const price = Number(listing.price);
+      if (!price || price <= 0) throw new UserFacingError('This product does not have a valid price.');
+
+      const inv = listing.inventory || { enabled: false };
+      let newQuantity = null;
+      if (inv.enabled && !inv.unlimited) {
+        const available = Number(inv.quantity) || 0;
+        if (available < quantity) {
+          throw new UserFacingError(available > 0 ? `Only ${available} item(s) are available.` : 'Sorry, this product is out of stock.');
+        }
+        newQuantity = available - quantity; // reserved immediately (spec §5 — pending reserves)
+      }
+
+      // ── Delivery fee: computed server-side per method, never client-trusted ──
+      const opts = listing.deliveryOptions || {};
+      let deliveryFee = 0;
+      let pricingSnapshot = { source: null, zoneId: null, stationId: null, negotiationId: null, ratePerRuleAtCheckout: 0 };
+      let orderStatus = 'awaiting_payment';
+
+      const deliverySettingsSnap = await tx.get(db.collection('siteConfig').doc('deliverySettings'));
+      const deliverySettings = deliverySettingsSnap.exists ? deliverySettingsSnap.data() : {};
+
+      if (deliveryMethod === 'seller_delivery') {
+        if (!opts.sellerDelivery || !opts.sellerDelivery.enabled || !(deliverySettings.sellerDelivery || {}).enabled) {
+          throw new UserFacingError('Seller delivery is not available for this product.');
+        }
+        const mode = opts.sellerDelivery.mode;
+        if (mode === 'free') {
+          deliveryFee = 0;
+          pricingSnapshot = { ...pricingSnapshot, source: 'free' };
+        } else if (mode === 'fixed') {
+          deliveryFee = Number(opts.sellerDelivery.fixedFee) || 0;
+          pricingSnapshot = { ...pricingSnapshot, source: 'seller_fixed', ratePerRuleAtCheckout: deliveryFee };
+        } else if (mode === 'negotiable') {
+          deliveryFee = 0; // unresolved until negotiation completes
+          orderStatus = 'awaiting_delivery_fee';
+          pricingSnapshot = { ...pricingSnapshot, source: 'seller_negotiated' };
+        } else {
+          throw new UserFacingError('Seller delivery is not configured correctly for this product.');
+        }
+      } else if (deliveryMethod === 'pickup_station') {
+        if (!opts.pickupStation || !opts.pickupStation.enabled || !(deliverySettings.pickupStation || {}).enabled) {
+          throw new UserFacingError('Pickup station delivery is not available for this product.');
+        }
+        if (!pickupStationId) throw new UserFacingError('Please select a pickup station.');
+        const stSnap = await tx.get(db.collection('pickupStations').doc(pickupStationId));
+        if (!stSnap.exists || stSnap.data().status !== 'active') {
+          throw new UserFacingError('This pickup station is currently unavailable. Please select another station.');
+        }
+        deliveryFee = Number(stSnap.data().fee) || 0;
+        pricingSnapshot = { ...pricingSnapshot, source: 'admin_station', stationId: pickupStationId, ratePerRuleAtCheckout: deliveryFee };
+      } else if (deliveryMethod === 'lowhub_delivery') {
+        if (!opts.lowhubDelivery || !opts.lowhubDelivery.enabled || !(deliverySettings.lowhubDelivery || {}).enabled) {
+          throw new UserFacingError('LowHub delivery is not available for this product.');
+        }
+        if (!deliveryAddress || !deliveryAddress.address || !deliveryAddress.phone) {
+          throw new UserFacingError('Please provide a delivery address and phone number.');
+        }
+        const dz = deliverySettings.lowhubDelivery || {};
+        if (dz.useZones) {
+          if (!deliveryZoneId) throw new UserFacingError('Please select a delivery zone.');
+          const zoneSnap = await tx.get(db.collection('deliveryZones').doc(deliveryZoneId));
+          if (!zoneSnap.exists || zoneSnap.data().active !== true) {
+            throw new UserFacingError('This delivery zone is currently unavailable.');
+          }
+          deliveryFee = Number(zoneSnap.data().fee) || 0;
+          pricingSnapshot = { ...pricingSnapshot, source: 'admin_zone', zoneId: deliveryZoneId, ratePerRuleAtCheckout: deliveryFee };
+        } else {
+          deliveryFee = Number(dz.flatFee) || 0;
+          pricingSnapshot = { ...pricingSnapshot, source: 'admin_zone', ratePerRuleAtCheckout: deliveryFee };
+        }
+      }
+
+      const subtotal = price * quantity;
+      const total = subtotal + deliveryFee;
+
+      // ── Reserve stock now (spec §5: pending order reserves quantity) ──
+      if (newQuantity !== null) {
+        tx.update(listingRef, { 'inventory.quantity': newQuantity });
+      }
+
+      const orderRef = db.collection('orders').doc();
+      const orderNumber = null; // generated after transaction (needs its own transaction on counters/*)
+
+      const orderData = {
+        orderNumber: null, // filled in right after
+        idempotencyKey: idempotencyKey || null,
+        buyerId, sellerId: listing.userId, listingId,
+        productSnapshot: {
+          title: listing.title || '', imageUrl: (listing.imageUrls && listing.imageUrls[0]) || null,
+          unitPrice: price, category: listing.category || null, condition: listing.condition || null
+        },
+        quantity, subtotal, deliveryMethod, deliveryFee, total, pricingSnapshot,
+        paymentStatus: 'unpaid', paymentProvider: null, transactionRef: null, paymentPhone: null, paymentCurrency: 'UGX',
+        orderStatus,
+        deliveryStatus: null,
+        buyerSnapshot: { name: '', phone: '' }, // filled from users/{buyerId} below (outside tx, non-critical)
+        sellerSnapshot: { name: seller.name || listing.userName || '', phone: listing.phone || '', companyName: seller.companyName || '' },
+        deliveryAddress: deliveryMethod !== 'pickup_station' ? (deliveryAddress || null) : null,
+        pickupStationId: deliveryMethod === 'pickup_station' ? pickupStationId : null,
+        pickupOtp: null,
+        conversationId: null,
+        cancelledBy: null, cancelReason: null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        statusTimestamps: { [orderStatus]: admin.firestore.FieldValue.serverTimestamp() }
+      };
+
+      tx.set(orderRef, orderData);
+      return { orderRef, orderData };
+    });
+
+    // Order number needs its own transaction (separate counters doc) — done
+    // just after the main transaction commits, then patched onto the order.
+    const orderNumber = await generateOrderNumber();
+    await result.orderRef.update({ orderNumber });
+
+    // Best-effort buyer snapshot fill + notifications — not part of the
+    // financial transaction, safe to do after commit.
+    try {
+      const buyerSnap = await buyerRef.get();
+      if (buyerSnap.exists) {
+        await result.orderRef.update({
+          buyerSnapshot: { name: buyerSnap.data().name || '', phone: buyerSnap.data().phone || '' }
+        });
+      }
+    } catch (e) { console.error('[orders/create] buyer snapshot fill failed:', e.message); }
+
+    await logOrderEvent(result.orderRef.id, { type: 'orderCreated', actorId: buyerId, actorRole: 'buyer', metadata: { orderNumber } });
+
+    await db.collection('userNotifications').add({
+      userId: result.orderData.sellerId,
+      type: 'newOrder',
+      message: `New order ${orderNumber} for "${result.orderData.productSnapshot.title}".`,
+      link: `seller-orders.html?id=${result.orderRef.id}`,
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    await db.collection('pendingPush').add({
+      userId: result.orderData.sellerId, title: 'New Order', body: `Order ${orderNumber} — ${result.orderData.productSnapshot.title}`,
+      link: `/seller-orders.html?id=${result.orderRef.id}`, sent: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, orderId: result.orderRef.id, orderNumber });
+  } catch (e) {
+    if (e instanceof UserFacingError) {
+      return res.status(400).json({ success: false, error: e.message });
+    }
+    console.error('[orders/create] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error creating order.' });
+  }
+});
+
+// Small helper error class so validation failures inside the transaction
+// produce a clean 400 with the specific reason, instead of a generic 500.
+class UserFacingError extends Error {}
+
+// POST /api/orders/:orderId/negotiate
+// Body: { action: 'propose'|'counter'|'accept'|'reject', amount? }
+// Handles the seller-delivery negotiation flow (spec §9, §52). Only the
+// order's buyer or seller may act on it, and only in the roles that make
+// sense (seller proposes/counters, buyer accepts/rejects/counters).
+app.post('/api/orders/:orderId/negotiate', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { orderId } = req.params;
+    const { action, amount } = req.body || {};
+    const uid = req.authUid;
+    if (!['propose', 'counter', 'accept', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'Invalid negotiation action.' });
+    }
+
+    const orderRef = db.collection('orders').doc(orderId);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(orderRef);
+      if (!snap.exists) throw new UserFacingError('Order not found.');
+      const order = snap.data();
+      if (uid !== order.buyerId && uid !== order.sellerId) throw new UserFacingError('Not authorized for this order.');
+      if (order.orderStatus !== 'awaiting_delivery_fee' && !(action === 'accept' && order.orderStatus === 'awaiting_delivery_fee')) {
+        if (order.orderStatus !== 'awaiting_delivery_fee') throw new UserFacingError('This order is not awaiting a delivery fee agreement.');
+      }
+
+      const isSellerActing = uid === order.sellerId;
+      if ((action === 'propose') && !isSellerActing) throw new UserFacingError('Only the seller can propose the initial delivery fee.');
+
+      const negRef = orderRef.collection('negotiations').doc();
+      const proposedBy = isSellerActing ? 'seller' : 'buyer';
+
+      if (action === 'accept') {
+        // Whoever accepts is agreeing to the most recent proposal's amount —
+        // amount is REQUIRED and must match the last proposal to prevent a
+        // buyer/seller from "accepting" a different number than what was
+        // actually offered.
+        const lastNegSnap = await tx.get(orderRef.collection('negotiations').orderBy('createdAt', 'desc').limit(1));
+        const lastAmount = !lastNegSnap.empty ? lastNegSnap.docs[0].data().amount : null;
+        if (lastAmount === null || Number(amount) !== Number(lastAmount)) {
+          throw new UserFacingError('The delivery fee to accept does not match the latest proposal.');
+        }
+        const newTotal = order.subtotal + Number(amount);
+        tx.set(negRef, { proposedBy, amount: Number(amount), action: 'accept', createdAt: admin.firestore.FieldValue.serverTimestamp() });
+        tx.update(orderRef, {
+          deliveryFee: Number(amount), total: newTotal, orderStatus: 'awaiting_payment',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          [`statusTimestamps.awaiting_payment`]: admin.firestore.FieldValue.serverTimestamp()
+        });
+      } else if (action === 'reject') {
+        tx.set(negRef, { proposedBy, amount: amount || null, action: 'reject', createdAt: admin.firestore.FieldValue.serverTimestamp() });
+        tx.update(orderRef, { orderStatus: 'cancelled', cancelledBy: isSellerActing ? 'seller' : 'buyer', cancelReason: 'Delivery fee negotiation rejected', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      } else {
+        // propose / counter
+        if (!amount || amount <= 0) throw new UserFacingError('Please provide a valid delivery fee amount.');
+        tx.set(negRef, { proposedBy, amount: Number(amount), action, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+        tx.update(orderRef, { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+    });
+
+    await logOrderEvent(orderId, { type: `deliveryFee${action.charAt(0).toUpperCase()+action.slice(1)}`, actorId: uid, actorRole: uid === (await orderRef.get()).data().sellerId ? 'seller' : 'buyer', metadata: { amount } });
+
+    const order = (await orderRef.get()).data();
+    const notifyUserId = uid === order.sellerId ? order.buyerId : order.sellerId;
+    await db.collection('userNotifications').add({
+      userId: notifyUserId, type: 'deliveryFeeNegotiation',
+      message: action === 'accept' ? `Delivery fee of UGX ${Number(amount).toLocaleString()} accepted for order ${order.orderNumber}.`
+        : action === 'reject' ? `Delivery fee negotiation was rejected for order ${order.orderNumber}.`
+        : `New delivery fee proposal of UGX ${Number(amount).toLocaleString()} for order ${order.orderNumber}.`,
+      link: `order.html?id=${orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    if (e instanceof UserFacingError) return res.status(400).json({ success: false, error: e.message });
+    console.error('[orders/negotiate] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error.' });
+  }
+});
+
+// POST /api/orders/:orderId/status
+// Body: { newStatus, reason? }
+// Central enforcement point for spec §11 ("do not allow arbitrary status
+// changes"). Validates the transition graph, checks the caller is the
+// order's buyer/seller/admin as appropriate for that specific transition,
+// and appends the event log entry.
+app.post('/api/orders/:orderId/status', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { orderId } = req.params;
+    const { newStatus, reason } = req.body || {};
+    const uid = req.authUid;
+    const isAdminCaller = req.headers['x-admin-token'] && req.headers['x-admin-token'] === ADMIN_API_TOKEN;
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const snap = await orderRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'Order not found.' });
+    const order = snap.data();
+
+    const isBuyer = uid === order.buyerId;
+    const isSeller = uid === order.sellerId;
+    const isAssignedAgent = !!order.deliveryAgentId && uid === order.deliveryAgentId;
+    if (!isBuyer && !isSeller && !isAssignedAgent && !isAdminCaller) return res.status(403).json({ success: false, error: 'Not authorized for this order.' });
+
+    if (!canTransitionOrderStatus(order.orderStatus, newStatus)) {
+      return res.status(400).json({ success: false, error: `Cannot move order from "${order.orderStatus}" to "${newStatus}".` });
+    }
+
+    // Role restrictions per transition — buyers can't mark their own order
+    // "confirmed"/"processing" etc, sellers can't mark "paid" (spec §13,
+    // §19 — payment confirmation must come from the trusted payment flow).
+    // 'delivered' is split from the other never-client targets: a seller
+    // (self-delivery) or an assigned delivery agent (LowHub delivery) may
+    // set it, but a buyer never can and 'picked_up'/'paid' remain fully
+    // backend/OTP-only regardless of role.
+    const sellerOnlyTargets = ['confirmed', 'rejected', 'processing', 'ready_for_dispatch', 'handed_to_lowhub', 'ready_for_pickup'];
+    const sellerOrAgentTargets = ['out_for_delivery', 'delivered'];
+    const neverClientTargets = ['paid', 'picked_up']; // paid=backend only; picked_up requires OTP flow via /verify-pickup
+    if (neverClientTargets.includes(newStatus) && !isAdminCaller) {
+      return res.status(403).json({ success: false, error: 'This status can only be set through the trusted order flow.' });
+    }
+    if (sellerOnlyTargets.includes(newStatus) && !isSeller && !isAdminCaller) {
+      return res.status(403).json({ success: false, error: 'Only the seller can set this status.' });
+    }
+    if (sellerOrAgentTargets.includes(newStatus) && !isSeller && !isAssignedAgent && !isAdminCaller) {
+      return res.status(403).json({ success: false, error: 'Only the seller or assigned delivery agent can set this status.' });
+    }
+    if (newStatus === 'cancelled') {
+      // Both buyer and seller may cancel, but only from early states.
+      if (!['pending', 'awaiting_delivery_fee', 'awaiting_payment', 'payment_pending'].includes(order.orderStatus) && !isAdminCaller) {
+        return res.status(400).json({ success: false, error: 'This order can no longer be cancelled — please contact the seller or open a dispute.' });
+      }
+    }
+
+    const updates = {
+      orderStatus: newStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      [`statusTimestamps.${newStatus}`]: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (newStatus === 'cancelled') {
+      updates.cancelledBy = isAdminCaller ? 'admin' : (isBuyer ? 'buyer' : 'seller');
+      updates.cancelReason = reason || null;
+      // Release reserved stock (spec §5 — cancelled order releases quantity)
+      const listingSnap = await db.collection('listings').doc(order.listingId).get();
+      if (listingSnap.exists) {
+        const inv = listingSnap.data().inventory || {};
+        if (inv.enabled && !inv.unlimited) {
+          await db.collection('listings').doc(order.listingId).update({
+            'inventory.quantity': admin.firestore.FieldValue.increment(order.quantity)
+          });
+        }
+      }
+    }
+    // Generate the pickup OTP the moment the order becomes ready for
+    // pickup (spec §16). A 6-digit numeric code, generated server-side so
+    // it's never visible to anyone but the buyer (via order.html) until
+    // they present it in person at the station.
+    if (newStatus === 'ready_for_pickup') {
+      updates.pickupOtp = String(Math.floor(100000 + Math.random() * 900000));
+    }
+
+    await orderRef.update(updates);
+    await logOrderEvent(orderId, { type: `status_${newStatus}`, actorId: uid, actorRole: isAdminCaller ? 'admin' : (isBuyer ? 'buyer' : 'seller'), metadata: { reason: reason || null } });
+
+    const notifyUserId = isBuyer ? order.sellerId : order.buyerId;
+    if (notifyUserId) {
+      await db.collection('userNotifications').add({
+        userId: notifyUserId, type: 'orderStatusChanged',
+        message: `Order ${order.orderNumber} is now "${newStatus.replace(/_/g,' ')}".`,
+        link: `order.html?id=${orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[orders/status] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error.' });
+  }
+});
+
+// POST /api/orders/:orderId/pay
+// Body: { phone }
+// Order-specific payment collection — deliberately separate from the
+// generic /api/payments/collect below rather than extended to share it,
+// because this endpoint must NEVER trust a client-supplied amount: it reads
+// order.total from Firestore itself (already server-computed at order
+// creation) and re-verifies the caller is the order's buyer via the
+// Authorization bearer token (spec §19, §20, §47). requireAuth also means
+// this endpoint can't be used to pay for someone else's order.
+app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { orderId } = req.params;
+    const { phone } = req.body || {};
+    const uid = req.authUid;
+
+    if (!phone) return res.status(400).json({ success: false, error: 'Phone number is required.' });
+    if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) {
+      return res.status(500).json({ success: false, error: 'Automatic payments are not configured on the server yet.' });
+    }
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return res.status(404).json({ success: false, error: 'Order not found.' });
+    const order = orderSnap.data();
+
+    if (order.buyerId !== uid) return res.status(403).json({ success: false, error: 'Not authorized for this order.' });
+    if (!['awaiting_payment'].includes(order.orderStatus)) {
+      return res.status(400).json({ success: false, error: 'This order is not awaiting payment.' });
+    }
+    if (order.paymentStatus === 'paid') return res.status(400).json({ success: false, error: 'This order has already been paid.' });
+
+    const normalizedPhone = normalizePhone(phone);
+    const ref = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
+    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
+
+    const paymentRef = db.collection('autoPayments').doc();
+    await paymentRef.set({
+      userId: uid, userEmail: req.authEmail || '', userName: order.buyerSnapshot?.name || '',
+      phone: normalizedPhone, amount: order.total, reference: ref,
+      purpose: 'order', orderId, orderNumber: order.orderNumber,
+      planKey: null, planName: null, planDays: null, dealPayload: null,
+      status: 'pending', provider: 'marzpay', marzpayTransactionId: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    let localPhone = normalizedPhone;
+    if (localPhone.startsWith('256')) localPhone = '0' + localPhone.slice(3);
+
+    let marzRes, marzData;
+    try {
+      marzRes = await fetch(`${MARZPAY_BASE_URL}/collect-money`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': marzpayAuthHeader() },
+        body: JSON.stringify({
+          phone_number: localPhone, amount: order.total, country: 'UG', reference: ref,
+          description: `LowHub order ${order.orderNumber}`,
+          ...(callbackUrl ? { callback_url: callbackUrl } : {})
+        })
+      });
+      marzData = await marzRes.json();
+      console.log('[orders/pay] MarzPay raw response:', JSON.stringify(marzData));
+    } catch (fetchErr) {
+      await paymentRef.update({ status: 'failed', failureReason: 'Could not reach MarzPay.', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      await orderRef.update({ orderStatus: 'payment_pending', paymentStatus: 'failed', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return res.status(502).json({ success: false, error: 'Could not reach the payment provider. Please try again.' });
+    }
+
+    if (!marzRes.ok || (marzData.status !== true && marzData.status !== 'success' && !marzData.success)) {
+      const errMsg = marzData?.message || 'MarzPay declined the request.';
+      await paymentRef.update({ status: 'failed', failureReason: errMsg, marzpayRawResponse: JSON.stringify(marzData).slice(0, 2000), updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      return res.status(400).json({ success: false, error: errMsg });
+    }
+
+    const txId = marzData?.data?.transaction?.uuid || marzData?.data?.id || marzData?.data?.collection_id || null;
+    await paymentRef.update({ marzpayTransactionId: txId, status: 'processing', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    await orderRef.update({ orderStatus: 'payment_pending', paymentStatus: 'pending', paymentProvider: 'marzpay', paymentPhone: normalizedPhone, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    await logOrderEvent(orderId, { type: 'paymentInitiated', actorId: uid, actorRole: 'buyer', metadata: { reference: ref } });
+
+    if (txId) pollMarzpayStatus(paymentRef.id, txId).catch(e => console.error('[poll] error:', e.message));
+
+    res.json({ success: true, paymentId: paymentRef.id, transactionId: txId });
+  } catch (e) {
+    console.error('[orders/pay] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error starting payment.' });
+  }
+});
+
+// POST /api/orders/:orderId/verify-pickup
+// Body: { otp }
+// Dedicated endpoint for the pickup-station flow (spec §16) — this is the
+// ONLY way an order can move to 'picked_up', enforced by requiring the OTP
+// that was generated server-side when the order became ready_for_pickup.
+// Any authenticated user may call this (station staff currently share the
+// admin login rather than having individual accounts — see
+// IMPLEMENTATION_PLAN.md's admin-identity note), but it still requires the
+// correct OTP, which only the buyer has seen.
+app.post('/api/orders/:orderId/verify-pickup', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { orderId } = req.params;
+    const { otp } = req.body || {};
+    const orderRef = db.collection('orders').doc(orderId);
+    const snap = await orderRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'Order not found.' });
+    const order = snap.data();
+
+    if (order.orderStatus !== 'ready_for_pickup') {
+      return res.status(400).json({ success: false, error: 'This order is not ready for pickup.' });
+    }
+    if (!otp || String(otp) !== String(order.pickupOtp)) {
+      return res.status(400).json({ success: false, error: 'Incorrect pickup code.' });
+    }
+
+    await orderRef.update({
+      orderStatus: 'picked_up', updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      'statusTimestamps.picked_up': admin.firestore.FieldValue.serverTimestamp()
+    });
+    await logOrderEvent(orderId, { type: 'status_picked_up', actorId: req.authUid, actorRole: 'admin', metadata: {} });
+    await db.collection('userNotifications').add({
+      userId: order.buyerId, type: 'orderStatusChanged',
+      message: `Order ${order.orderNumber} has been picked up. Thank you for using LowHub!`,
+      link: `order.html?id=${orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[orders/verify-pickup] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -359,6 +971,8 @@ async function applyPaymentStatus(marzpayTxId, status, rawPayload) {
     // in admin.html / admin-payments.html, regardless of this branch.
     if (data.purpose === 'deal') {
       await activateDealFromPayment(data);
+    } else if (data.purpose === 'order') {
+      await activateOrderFromPayment(data);
     } else {
       await activatePremiumPlan(data);
     }
@@ -368,8 +982,65 @@ async function applyPaymentStatus(marzpayTxId, status, rawPayload) {
       failureReason: rawPayload?.data?.message || rawPayload?.message || 'Payment was declined or cancelled.',
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    if (data.purpose === 'order' && data.orderId) {
+      await db.collection('orders').doc(data.orderId).update({
+        paymentStatus: 'failed', orderStatus: 'payment_failed', updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await logOrderEvent(data.orderId, { type: 'paymentFailed', actorRole: 'system', metadata: { reason: rawPayload?.data?.message || rawPayload?.message || null } });
+      const orderSnap = await db.collection('orders').doc(data.orderId).get();
+      if (orderSnap.exists) {
+        await db.collection('userNotifications').add({
+          userId: orderSnap.data().buyerId, type: 'paymentFailed',
+          message: `Payment failed for order ${orderSnap.data().orderNumber}. Your order has not been confirmed.`,
+          link: `order.html?id=${data.orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    }
   }
   // 'pending' — leave as-is, poller/webhook will fire again later.
+}
+
+// Confirms an order's payment once MarzPay reports success. Moves the order
+// PAID -> SELLER_CONFIRMATION (spec §11 — seller must still confirm
+// availability even after payment) and permanently deducts the already-
+// reserved stock (spec §5 — confirmed/paid order deducts quantity; it was
+// only "reserved", not yet deducted, at order-creation time). This is the
+// ONLY code path allowed to set paymentStatus:'paid' — never the browser,
+// never a generic status-update endpoint (spec §13, §19).
+async function activateOrderFromPayment(payment) {
+  const orderRef = db.collection('orders').doc(payment.orderId);
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) { console.warn('[order] no order found for payment', payment.orderId); return; }
+  const order = orderSnap.data();
+
+  if (order.paymentStatus === 'paid') return; // idempotency guard
+
+  await orderRef.update({
+    paymentStatus: 'paid',
+    orderStatus: 'seller_confirmation',
+    transactionRef: payment.reference || null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    'statusTimestamps.paid': admin.firestore.FieldValue.serverTimestamp(),
+    'statusTimestamps.seller_confirmation': admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  await logOrderEvent(payment.orderId, { type: 'paymentConfirmed', actorRole: 'system', metadata: { reference: payment.reference || null } });
+  await logOrderEvent(payment.orderId, { type: 'sellerConfirmationRequested', actorRole: 'system', metadata: {} });
+
+  await db.collection('userNotifications').add({
+    userId: order.buyerId, type: 'paymentSuccess',
+    message: `Payment received for order ${order.orderNumber}. Waiting for seller confirmation.`,
+    link: `order.html?id=${payment.orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  await db.collection('userNotifications').add({
+    userId: order.sellerId, type: 'orderPaid',
+    message: `Order ${order.orderNumber} has been paid. Please confirm availability.`,
+    link: `seller-orders.html?id=${payment.orderId}`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  await db.collection('pendingPush').add({
+    userId: order.sellerId, title: 'Order Paid', body: `Order ${order.orderNumber} — please confirm availability.`,
+    link: `/seller-orders.html?id=${payment.orderId}`, sent: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
 }
 
 // Activates the user's premium plan in Firestore once payment is confirmed
