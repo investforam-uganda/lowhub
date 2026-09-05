@@ -181,10 +181,25 @@ async function requireAuth(req, res, next) {
 // expects, accepting common local formats (0745..., 745..., +256745...).
 function normalizePhone(raw) {
   let p = String(raw || '').replace(/[^\d]/g, '');
+  // Strip an international-dial "00" prefix (e.g. "00256755123456") before
+  // the rest of the logic runs, so it doesn't fall through every branch
+  // below untouched and get shipped to MarzPay as a malformed 11+ digit
+  // string (which MarzPay would reject with its own generic validation
+  // error, showing up to the user as an unhelpful "check your input").
+  if (p.startsWith('00')) p = p.slice(2);
   if (p.startsWith('0')) p = '256' + p.slice(1);
   else if (p.startsWith('256')) { /* already fine */ }
   else if (p.length === 9) p = '256' + p;
   return p;
+}
+
+// A normalized Ugandan MSISDN is always "256" + 9 digits = 12 digits total.
+// Anything else (stray digits, a copy-pasted landline, a typo) should be
+// caught here with a clear, specific LowHub message — rather than being
+// forwarded to MarzPay, whose own generic validation error ("check your
+// input" style messages) would otherwise be the first thing the user sees.
+function isValidUgandaPhone(normalized) {
+  return /^256\d{9}$/.test(normalized);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -671,6 +686,9 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
     if (order.paymentStatus === 'paid') return res.status(400).json({ success: false, error: 'This order has already been paid.' });
 
     const normalizedPhone = normalizePhone(phone);
+    if (!isValidUgandaPhone(normalizedPhone)) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid mobile money number, e.g. 0755 123456.' });
+    }
     const ref = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
     const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
@@ -809,6 +827,9 @@ app.post('/api/payments/collect', async (req, res) => {
     }
 
     const normalizedPhone = normalizePhone(phone);
+    if (!isValidUgandaPhone(normalizedPhone)) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid mobile money number, e.g. 0755 123456.' });
+    }
     const ref = reference || `LH-${itemKey}-${Date.now()}`;
     const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
