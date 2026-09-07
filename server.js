@@ -1111,17 +1111,25 @@ async function activateOrderFromPayment(payment) {
 // order: if a walletTransactions row already exists for this orderId, it
 // does nothing (guards against the webhook and poller both firing for the
 // same payment — same pattern as applyPaymentStatus's own guard above).
-async function creditWallet({ userId, amount, orderId, orderNumber, description }) {
-  if (!userId || !amount || amount <= 0) return;
+async function creditWallet({ userId, amount, orderId, orderNumber, description, notify = true }) {
+  if (!userId || !orderId || !amount || amount <= 0) return false;
 
-  const existing = await db.collection('walletTransactions')
-    .where('orderId', '==', orderId).where('source', '==', 'order_payment').limit(1).get();
-  if (!existing.empty) return; // already credited
+  // First recognize older ledger rows created before this idempotency fix.
+  // orderId alone is a single-field query and does not require a composite
+  // index. The deterministic document below handles concurrent webhook +
+  // poller execution safely.
+  const legacy = await db.collection('walletTransactions')
+    .where('orderId', '==', orderId).limit(1).get();
+  if (!legacy.empty) return false;
 
   const walletRef = db.collection('wallets').doc(userId);
-  const txRef = db.collection('walletTransactions').doc();
+  const txRef = db.collection('walletTransactions').doc(`sale_${orderId}`);
+  let credited = false;
 
   await db.runTransaction(async (tx) => {
+    const existing = await tx.get(txRef);
+    if (existing.exists) return; // concurrent/previous credit
+
     const walletSnap = await tx.get(walletRef);
     const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
     const newBalance = (current.balance || 0) + amount;
@@ -1141,13 +1149,35 @@ async function creditWallet({ userId, amount, orderId, orderNumber, description 
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    credited = true;
   });
 
-  await db.collection('userNotifications').add({
-    userId, type: 'walletCredit',
-    message: `${(amount).toLocaleString()} UGX added to your LowHub wallet from ${description || 'a sale'}.`,
-    link: `wallet.html`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
+  if (credited && notify) {
+    await db.collection('userNotifications').add({
+      userId, type: 'walletCredit',
+      message: `${amount.toLocaleString()} UGX added to your LowHub wallet from ${description || 'a sale'}.`,
+      link: `wallet.html`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  }
+  return credited;
+}
+
+// Repairs any previously-paid seller orders whose wallet credit was missed
+// by an older version of the payment handler. sellerId is the only query
+// filter, so this does not depend on a composite Firestore index.
+async function reconcileSellerWallet(userId) {
+  if (!userId) return;
+  const snap = await db.collection('orders').where('sellerId', '==', userId).get();
+  for (const doc of snap.docs) {
+    const order = doc.data();
+    if (order.paymentStatus !== 'paid') continue;
+    await creditWallet({
+      userId, amount: order.subtotal || 0, orderId: doc.id,
+      orderNumber: order.orderNumber,
+      description: `Sale — ${order.productSnapshot?.title || 'Order'} (${order.orderNumber || doc.id})`,
+      notify: false
+    });
+  }
 }
 
 // Activates the user's premium plan in Firestore once payment is confirmed
@@ -1319,6 +1349,7 @@ async function pollMarzpayStatus(paymentDocId, txId) {
 app.get('/api/wallet/summary', requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
+    await reconcileSellerWallet(req.authUid);
     const snap = await db.collection('wallets').doc(req.authUid).get();
     const w = snap.exists ? snap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
     const feeSnap = await db.collection('siteConfig').doc('walletSettings').get();
@@ -1347,11 +1378,9 @@ app.get('/api/wallet/summary', requireAuth, async (req, res) => {
 app.get('/api/wallet/transactions', requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 500, 500);
     const snap = await db.collection('walletTransactions')
       .where('userId', '==', req.authUid)
-      .orderBy('createdAt', 'desc')
-      .limit(limit)
       .get();
     const transactions = snap.docs.map(d => {
       const t = d.data();
@@ -1362,7 +1391,7 @@ app.get('/api/wallet/transactions', requireAuth, async (req, res) => {
         balanceAfter: t.balanceAfter,
         createdAt: t.createdAt ? t.createdAt.toDate().toISOString() : null
       };
-    });
+    }).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)).slice(0, limit);
     res.json({ success: true, transactions });
   } catch (e) {
     console.error('[wallet/transactions] error:', e.message);
@@ -1726,6 +1755,209 @@ async function sendToAllUsers(title, body, link) {
 
 // Poll the queue every 15 seconds.
 setInterval(processPendingPush, 15000);
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADMIN FINANCE + PICKUP OPERATIONS
+// These endpoints are intentionally admin-token protected. The existing
+// browser admin login is sessionStorage based, so it cannot be represented as
+// a Firebase Auth claim. Never expose the token in source code.
+// ─────────────────────────────────────────────────────────────────────────
+
+function tsIso(v) {
+  if (!v) return null;
+  try {
+    if (typeof v.toDate === 'function') return v.toDate().toISOString();
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  } catch (_) { return null; }
+}
+
+app.get('/api/admin/transactions', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const [walletSnap, paymentsSnap, withdrawalsSnap, premiumSnap, dealsSnap, usersSnap, ordersSnap] = await Promise.all([
+      db.collection('walletTransactions').get(),
+      db.collection('autoPayments').get(),
+      db.collection('autoWithdrawals').get(),
+      db.collection('premiumRequests').get(),
+      db.collection('dealRequests').get(),
+      db.collection('users').get(),
+      db.collection('orders').get()
+    ]);
+
+    const users = {};
+    usersSnap.forEach(d => { users[d.id] = { id: d.id, ...(d.data() || {}) }; });
+    const person = (uid, fallbackName, fallbackEmail) => {
+      const u = users[uid] || {};
+      return {
+        userId: uid || null,
+        name: u.name || fallbackName || 'Unknown user',
+        email: u.email || fallbackEmail || '',
+        phone: u.phone || ''
+      };
+    };
+
+    const orders = {};
+    ordersSnap.forEach(d => { orders[d.id] = d.data() || {}; });
+
+    const rows = [];
+    paymentsSnap.forEach(d => {
+      const p = d.data() || {};
+      rows.push({
+        id: d.id, kind: 'payment', source: 'autoPayments', purpose: p.purpose || 'payment',
+        amount: Number(p.amount || 0), status: p.status || 'unknown',
+        reference: p.reference || p.internalRef || p.marzpayTransactionId || '',
+        actor: person(p.userId, p.userName, p.userEmail),
+        counterparty: p.orderId && orders[p.orderId] ? {
+          buyer: person(orders[p.orderId].buyerId, orders[p.orderId].buyerSnapshot?.name, ''),
+          seller: person(orders[p.orderId].sellerId, orders[p.orderId].sellerSnapshot?.name, '')
+        } : null,
+        description: p.purpose === 'order' ? `Order ${p.orderNumber || p.orderId || ''}` :
+          p.purpose === 'deal' ? `Deal payment${p.planName ? ` — ${p.planName}` : ''}` :
+          `Premium — ${p.planName || p.planKey || 'Plan'}`,
+        orderId: p.orderId || null, orderNumber: p.orderNumber || null,
+        createdAt: tsIso(p.createdAt), completedAt: tsIso(p.completedAt),
+        provider: p.provider || 'marzpay'
+      });
+    });
+
+    walletSnap.forEach(d => {
+      const t = d.data() || {};
+      rows.push({
+        id: d.id, kind: 'wallet', source: t.source || 'wallet', purpose: t.type || 'wallet',
+        amount: Number(t.amount || 0), status: t.status || 'unknown',
+        reference: t.withdrawalId || t.orderNumber || t.orderId || d.id,
+        actor: person(t.userId),
+        counterparty: t.orderId && orders[t.orderId] ? {
+          buyer: person(orders[t.orderId].buyerId, orders[t.orderId].buyerSnapshot?.name, ''),
+          seller: person(orders[t.orderId].sellerId, orders[t.orderId].sellerSnapshot?.name, '')
+        } : null,
+        description: t.description || (t.type === 'credit' ? 'Wallet credit' : 'Wallet debit'),
+        orderId: t.orderId || null, orderNumber: t.orderNumber || null,
+        createdAt: tsIso(t.createdAt), completedAt: null, provider: t.type === 'debit' ? 'marzpay' : 'lowhub'
+      });
+    });
+
+    withdrawalsSnap.forEach(d => {
+      const w = d.data() || {};
+      rows.push({
+        id: d.id, kind: 'withdrawal', source: 'autoWithdrawals', purpose: 'withdrawal',
+        amount: Number(w.amountRequested || 0), amountSent: Number(w.amountSent || 0), status: w.status || 'unknown',
+        reference: w.reference || w.marzpayTransactionId || d.id, actor: person(w.userId),
+        description: `Withdrawal to ${w.phone || 'mobile money'}`,
+        orderId: null, orderNumber: null, createdAt: tsIso(w.createdAt), completedAt: tsIso(w.completedAt), provider: 'marzpay'
+      });
+    });
+
+    premiumSnap.forEach(d => {
+      const r = d.data() || {};
+      rows.push({
+        id: d.id, kind: 'manual_payment', source: 'premiumRequests', purpose: 'premium',
+        amount: Number(r.planPrice || 0), status: r.status || 'unknown',
+        reference: r.transactionRef || d.id, actor: person(r.userId, r.userName, r.userEmail),
+        description: `Manual Premium — ${r.planName || r.planKey || 'Plan'}`,
+        orderId: null, orderNumber: null, createdAt: tsIso(r.requestedAt || r.createdAt), completedAt: null, provider: r.paymentMethod || 'manual'
+      });
+    });
+
+    dealsSnap.forEach(d => {
+      const r = d.data() || {};
+      rows.push({
+        id: d.id, kind: 'manual_payment', source: 'dealRequests', purpose: 'deal',
+        amount: Number(r.totalAmount || 0), status: r.status || 'unknown',
+        reference: r.transactionRef || d.id, actor: person(r.userId, r.userName, r.userEmail),
+        description: `Manual Deal — ${r.heading || 'Deal'}`,
+        orderId: null, orderNumber: null, createdAt: tsIso(r.submittedAt || r.createdAt), completedAt: null, provider: r.paymentMethod || 'manual'
+      });
+    });
+
+    rows.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    res.json({ success: true, transactions: rows, generatedAt: new Date().toISOString() });
+  } catch (e) {
+    console.error('[admin/transactions] error:', e);
+    res.status(500).json({ success: false, error: 'Could not load transactions.' });
+  }
+});
+
+app.get('/api/admin/pickup-dashboard', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const [stationsSnap, ordersSnap] = await Promise.all([
+      db.collection('pickupStations').get(),
+      db.collection('orders').where('deliveryMethod', '==', 'pickup_station').get()
+    ]);
+    const stations = stationsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const stationMap = Object.fromEntries(stations.map(s => [s.id, s]));
+    const orders = ordersSnap.docs.map(d => {
+      const o = d.data() || {};
+      const st = stationMap[o.pickupStationId] || {};
+      return {
+        id: d.id, orderNumber: o.orderNumber || d.id.slice(0, 8), orderStatus: o.orderStatus || '',
+        paymentStatus: o.paymentStatus || '', product: o.productSnapshot || {}, quantity: o.quantity || 1,
+        subtotal: Number(o.subtotal || 0), total: Number(o.total || 0), deliveryFee: Number(o.deliveryFee || 0),
+        buyer: o.buyerSnapshot || {}, seller: o.sellerSnapshot || {}, buyerId: o.buyerId || null, sellerId: o.sellerId || null,
+        pickupStationId: o.pickupStationId || null, pickupStation: { id: st.id || null, name: st.name || 'Unknown station', address: st.address || st.location || '' },
+        pickupOtp: o.pickupOtp || null, createdAt: tsIso(o.createdAt), updatedAt: tsIso(o.updatedAt)
+      };
+    }).sort((a,b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    const stats = {
+      total: orders.length,
+      awaiting: orders.filter(o => ['paid','seller_confirmation','confirmed','processing','ready_for_dispatch'].includes(o.orderStatus)).length,
+      ready: orders.filter(o => o.orderStatus === 'ready_for_pickup').length,
+      pickedUp: orders.filter(o => ['picked_up','completed'].includes(o.orderStatus)).length
+    };
+    res.json({ success: true, stations, orders, stats });
+  } catch (e) {
+    console.error('[admin/pickup-dashboard] error:', e);
+    res.status(500).json({ success: false, error: 'Could not load pickup dashboard.' });
+  }
+});
+
+app.post('/api/admin/pickup/status', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { orderId, newStatus } = req.body || {};
+    if (!orderId || newStatus !== 'ready_for_pickup') return res.status(400).json({ success:false, error:'Only marking an order ready for pickup is supported here.' });
+    const ref = db.collection('orders').doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ success:false, error:'Order not found.' });
+    const order = snap.data();
+    if (order.deliveryMethod !== 'pickup_station') return res.status(400).json({ success:false, error:'This is not a pickup-station order.' });
+    if (!canTransitionOrderStatus(order.orderStatus, newStatus)) return res.status(400).json({ success:false, error:`Cannot move order from "${order.orderStatus}" to "${newStatus}".` });
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.update({ orderStatus:newStatus, pickupOtp:otp, updatedAt:admin.firestore.FieldValue.serverTimestamp(), 'statusTimestamps.ready_for_pickup':admin.firestore.FieldValue.serverTimestamp() });
+    await logOrderEvent(orderId, { type:'status_ready_for_pickup', actorId:'admin', actorRole:'admin', metadata:{} });
+    await db.collection('userNotifications').add({ userId:order.buyerId, type:'orderStatusChanged', message:`Order ${order.orderNumber || orderId} is ready for pickup. Show your pickup code at the station.`, link:`order.html?id=${orderId}`, read:false, createdAt:admin.firestore.FieldValue.serverTimestamp() });
+    res.json({success:true});
+  } catch(e) {
+    console.error('[admin/pickup/status] error:', e);
+    res.status(500).json({success:false,error:'Could not update pickup order.'});
+  }
+});
+
+app.post('/api/admin/pickup/verify', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { orderId, otp } = req.body || {};
+    const ref = db.collection('orders').doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({success:false,error:'Order not found.'});
+    const order = snap.data();
+    if (order.deliveryMethod !== 'pickup_station' || order.orderStatus !== 'ready_for_pickup') return res.status(400).json({success:false,error:'This order is not ready for pickup.'});
+    if (!otp || String(otp) !== String(order.pickupOtp || '')) return res.status(400).json({success:false,error:'Incorrect pickup code.'});
+    await ref.update({orderStatus:'picked_up', updatedAt:admin.firestore.FieldValue.serverTimestamp(), 'statusTimestamps.picked_up':admin.firestore.FieldValue.serverTimestamp()});
+    await logOrderEvent(orderId, {type:'status_picked_up',actorId:'admin',actorRole:'admin',metadata:{}});
+    await db.collection('userNotifications').add({userId:order.buyerId,type:'orderStatusChanged',message:`Order ${order.orderNumber || orderId} has been picked up.`,link:`order.html?id=${orderId}`,read:false,createdAt:admin.firestore.FieldValue.serverTimestamp()});
+    res.json({success:true});
+  } catch(e) {
+    console.error('[admin/pickup/verify] error:', e);
+    res.status(500).json({success:false,error:'Could not verify pickup.'});
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────
 // 3. ADMIN PAYMENT SETTINGS
