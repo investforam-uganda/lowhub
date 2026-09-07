@@ -958,18 +958,34 @@ app.post('/api/payments/webhook', async (req, res) => {
     const status = extractStatus(body);
     if (!txId) { console.warn('[webhook] no transaction id found in payload'); return; }
 
-    await applyPaymentStatus(txId, status, body);
+    // One shared webhook URL handles both collections (money IN, from
+    // /collect-money) and disbursements (money OUT, from /send-money —
+    // wallet withdrawals). Try withdrawal first since applyWithdrawalStatus
+    // can tell us definitively whether this txId belongs to it (returns
+    // false if not, with no side effects) — only fall through to the
+    // collections/premium/deal/order path if it doesn't.
+    const wasWithdrawal = await applyWithdrawalStatus(txId, status, body);
+    if (!wasWithdrawal) {
+      await applyPaymentStatus(txId, status, body);
+    }
   } catch (e) {
     console.error('[webhook] error:', e.message);
   }
 });
 
+// Collection (collect-money) callbacks nest the transaction under `data`;
+// disbursement (send-money) callbacks — per MarzPay's own Send Money docs —
+// put `transaction` at the TOP level instead (event_type:
+// "disbursement.completed"/"disbursement.failed", transaction.uuid,
+// transaction.status). Check both shapes so one webhook handler covers
+// both payment directions.
 function extractTxId(body) {
-  return body?.data?.transaction?.uuid || body?.data?.id || body?.transaction_id
-    || body?.reference || body?.data?.reference || body?.uuid || null;
+  return body?.transaction?.uuid || body?.data?.transaction?.uuid || body?.data?.id
+    || body?.transaction_id || body?.reference || body?.data?.reference || body?.uuid || null;
 }
 function extractStatus(body) {
-  const raw = (body?.data?.transaction?.status || body?.data?.status || body?.status || body?.event || '').toString().toLowerCase();
+  const raw = (body?.event_type || body?.transaction?.status || body?.data?.transaction?.status
+    || body?.data?.status || body?.status || body?.event || '').toString().toLowerCase();
   if (raw.includes('success') || raw.includes('complete')) return 'completed';
   if (raw.includes('fail') || raw.includes('decline') || raw.includes('cancel')) return 'failed';
   return 'pending';
@@ -1072,6 +1088,65 @@ async function activateOrderFromPayment(payment) {
   await db.collection('pendingPush').add({
     userId: order.sellerId, title: 'Order Paid', body: `Order ${order.orderNumber} — please confirm availability.`,
     link: `/seller-orders.html?id=${payment.orderId}`, sent: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  // ── Credit the seller's wallet (spec: "seller sees that money in their
+  // dashboard"). Amount = order.subtotal only (product revenue) — the
+  // delivery fee is never the seller's money, same convention already used
+  // by seller-analytics.html's "Revenue (Completed)" figure. This is the
+  // ONLY code path that credits a wallet from an order (mirrors
+  // paymentStatus:'paid' being backend-only, see firestore.rules).
+  await creditWallet({
+    userId: order.sellerId,
+    amount: order.subtotal || 0,
+    orderId: payment.orderId,
+    orderNumber: order.orderNumber,
+    description: `Sale — ${order.productSnapshot?.title || 'Order'} (${order.orderNumber})`
+  });
+}
+
+// Credits a seller's wallet and writes the matching ledger row inside one
+// Firestore transaction, so balance and ledger can never drift apart even
+// under concurrent orders completing at the same moment. Idempotent per
+// order: if a walletTransactions row already exists for this orderId, it
+// does nothing (guards against the webhook and poller both firing for the
+// same payment — same pattern as applyPaymentStatus's own guard above).
+async function creditWallet({ userId, amount, orderId, orderNumber, description }) {
+  if (!userId || !amount || amount <= 0) return;
+
+  const existing = await db.collection('walletTransactions')
+    .where('orderId', '==', orderId).where('source', '==', 'order_payment').limit(1).get();
+  if (!existing.empty) return; // already credited
+
+  const walletRef = db.collection('wallets').doc(userId);
+  const txRef = db.collection('walletTransactions').doc();
+
+  await db.runTransaction(async (tx) => {
+    const walletSnap = await tx.get(walletRef);
+    const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+    const newBalance = (current.balance || 0) + amount;
+
+    tx.set(walletRef, {
+      balance: newBalance,
+      totalEarned: (current.totalEarned || 0) + amount,
+      totalWithdrawn: current.totalWithdrawn || 0,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    tx.set(txRef, {
+      userId, type: 'credit', source: 'order_payment', amount,
+      status: 'completed', orderId, orderNumber: orderNumber || null,
+      withdrawalId: null, description: description || 'Sale',
+      balanceAfter: newBalance,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  });
+
+  await db.collection('userNotifications').add({
+    userId, type: 'walletCredit',
+    message: `${(amount).toLocaleString()} UGX added to your LowHub wallet from ${description || 'a sale'}.`,
+    link: `wallet.html`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
 }
 
@@ -1228,6 +1303,357 @@ async function pollMarzpayStatus(paymentDocId, txId) {
   }
   console.warn('[poll] gave up waiting for transaction', txId);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// 1B. SELLER WALLET — balance, transaction history, withdrawal via MarzPay
+//     send-money (disbursements). Mirrors the collections (/collect-money)
+//     flow above as closely as possible: same UUID v4 reference requirement,
+//     same +256 phone format, same multipart/form-data body, same
+//     webhook + poller backstop pattern — see MarzPay's own Send Money docs
+//     (https://wallet.wearemarz.com/documentation/send-money), which use
+//     identical conventions to the collections endpoint this file already
+//     has working.
+// ─────────────────────────────────────────────────────────────────────────
+
+// GET /api/wallet/summary — balance + lifetime totals for the caller.
+app.get('/api/wallet/summary', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const snap = await db.collection('wallets').doc(req.authUid).get();
+    const w = snap.exists ? snap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+    const feeSnap = await db.collection('siteConfig').doc('walletSettings').get();
+    const feePercent = (feeSnap.exists && typeof feeSnap.data().withdrawalFeePercent === 'number')
+      ? feeSnap.data().withdrawalFeePercent : 0;
+    res.json({
+      success: true,
+      balance: w.balance || 0,
+      totalEarned: w.totalEarned || 0,
+      totalWithdrawn: w.totalWithdrawn || 0,
+      withdrawalFeePercent: feePercent
+    });
+  } catch (e) {
+    console.error('[wallet/summary] error:', e.message);
+    res.status(500).json({ success: false, error: 'Could not load wallet.' });
+  }
+});
+
+// GET /api/wallet/transactions — this seller's own ledger (credits +
+// debits), for the "transaction history" view (spec: successful/
+// unsuccessful, timestamp, what it was for). Firestore rules already
+// restrict walletTransactions reads to the doc's own userId, but this
+// endpoint filters server-side too so the frontend can call it plainly
+// (and so a future non-Firestore-SDK client — e.g. a mobile app — has a
+// normal REST path instead of needing the Firestore SDK at all).
+app.get('/api/wallet/transactions', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const snap = await db.collection('walletTransactions')
+      .where('userId', '==', req.authUid)
+      .orderBy('createdAt', 'desc')
+      .limit(limit)
+      .get();
+    const transactions = snap.docs.map(d => {
+      const t = d.data();
+      return {
+        id: d.id, type: t.type, source: t.source, amount: t.amount, status: t.status,
+        orderId: t.orderId || null, orderNumber: t.orderNumber || null,
+        withdrawalId: t.withdrawalId || null, description: t.description || '',
+        balanceAfter: t.balanceAfter,
+        createdAt: t.createdAt ? t.createdAt.toDate().toISOString() : null
+      };
+    });
+    res.json({ success: true, transactions });
+  } catch (e) {
+    console.error('[wallet/transactions] error:', e.message);
+    res.status(500).json({ success: false, error: 'Could not load transaction history.' });
+  }
+});
+
+// POST /api/wallet/withdraw — body: { phone, amount }
+// Starts a MarzPay send-money disbursement to the seller's own mobile money
+// number. The requested amount is deducted from the wallet balance
+// UP FRONT (status: 'pending' in the ledger) so a seller can never
+// double-spend by firing two withdrawals before either resolves — if the
+// disbursement later fails, applyWithdrawalStatus() below refunds it.
+// This mirrors how order creation reserves stock before payment confirms it.
+app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { phone, amount } = req.body || {};
+    const uid = req.authUid;
+    const amountRequested = Number(amount);
+
+    if (!phone) return res.status(400).json({ success: false, error: 'Phone number is required.' });
+    if (!amountRequested || amountRequested <= 0) return res.status(400).json({ success: false, error: 'Enter a valid amount.' });
+    if (amountRequested < 500) return res.status(400).json({ success: false, error: 'Minimum withdrawal is UGX 500 (MarzPay\'s own minimum).' });
+    if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) {
+      return res.status(500).json({ success: false, error: 'Withdrawals are not configured on the server yet.' });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+    if (!isValidUgandaPhone(normalizedPhone)) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid mobile money number, e.g. 0755 123456.' });
+    }
+
+    const walletRef = db.collection('wallets').doc(uid);
+    const feeSnap = await db.collection('siteConfig').doc('walletSettings').get();
+    const feePercent = (feeSnap.exists && typeof feeSnap.data().withdrawalFeePercent === 'number')
+      ? feeSnap.data().withdrawalFeePercent : 0;
+    const feeAmount = Math.round(amountRequested * (feePercent / 100));
+    const amountSent = amountRequested - feeAmount;
+    if (amountSent < 500) return res.status(400).json({ success: false, error: 'Amount after fee is below MarzPay\'s UGX 500 minimum.' });
+
+    const withdrawalRef = db.collection('autoWithdrawals').doc();
+    const txRef = db.collection('walletTransactions').doc();
+
+    // Reserve the funds (deduct from balance now, refund on failure) inside
+    // a transaction so two concurrent withdrawals can never both read the
+    // same starting balance and overdraw the wallet.
+    try {
+      await db.runTransaction(async (tx) => {
+        const walletSnap = await tx.get(walletRef);
+        const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+        const balance = current.balance || 0;
+        if (balance < amountRequested) {
+          throw new UserFacingError(`Insufficient balance. Available: UGX ${balance.toLocaleString()}.`);
+        }
+        const newBalance = balance - amountRequested;
+        tx.set(walletRef, {
+          balance: newBalance,
+          totalEarned: current.totalEarned || 0,
+          totalWithdrawn: current.totalWithdrawn || 0, // only incremented once withdrawal actually completes
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        tx.set(txRef, {
+          userId: uid, type: 'debit', source: 'withdrawal', amount: amountRequested,
+          status: 'pending', orderId: null, orderNumber: null, withdrawalId: withdrawalRef.id,
+          description: `Withdrawal to ${normalizedPhone}${feeAmount ? ` (fee ${feeAmount.toLocaleString()} UGX)` : ''}`,
+          balanceAfter: newBalance,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      });
+    } catch (e) {
+      if (e instanceof UserFacingError) return res.status(400).json({ success: false, error: e.message });
+      throw e;
+    }
+
+    const ref = crypto.randomUUID();
+    const internalRef = `LH-WD-${uid}-${Date.now()}`;
+    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
+
+    await withdrawalRef.set({
+      userId: uid, userEmail: req.authEmail || '', userName: '',
+      phone: normalizedPhone, amountRequested, feePercent, feeAmount, amountSent,
+      reference: ref, internalRef, status: 'pending', marzpayTransactionId: null,
+      failureReason: null, rawWebhook: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const marzPhone = '+' + normalizedPhone;
+    let marzRes, marzData;
+    try {
+      // NOTE ON REQUEST FORMAT: MarzPay's published docs show send-money
+      // (and collect-money) as multipart/form-data (`--form` in their curl
+      // examples). However, THIS account's /collect-money integration —
+      // above in this same file, already proven working against real
+      // MarzPay responses — needed a plain JSON body instead. Since
+      // send-money is the sibling endpoint on the same account/API keys,
+      // this follows that proven JSON convention rather than the generic
+      // docs example. If MarzPay rejects this with a format-related
+      // VALIDATION_ERROR (check the Render logs for the raw response
+      // logged below), switch this one call to multipart/form-data — see
+      // the commented alternative just below — without touching
+      // collect-money, which is unrelated and already works.
+      marzRes = await fetch(`${MARZPAY_BASE_URL}/send-money`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': marzpayAuthHeader() },
+        body: JSON.stringify({
+          phone_number: marzPhone, amount: amountSent, country: 'UG', reference: ref,
+          description: `LowHub wallet withdrawal`,
+          ...(callbackUrl ? { callback_url: callbackUrl } : {})
+        })
+        // Multipart alternative, if JSON gets rejected for this endpoint:
+        //   const form = new URLSearchParams();
+        //   form.append('phone_number', marzPhone); form.append('amount', String(amountSent));
+        //   form.append('country', 'UG'); form.append('reference', ref);
+        //   form.append('description', 'LowHub wallet withdrawal');
+        //   if (callbackUrl) form.append('callback_url', callbackUrl);
+        //   ... headers: { 'Authorization': marzpayAuthHeader() }, body: form
+      });
+      marzData = await marzRes.json();
+      console.log('[wallet/withdraw] MarzPay raw response:', JSON.stringify(marzData));
+    } catch (fetchErr) {
+      await refundWithdrawal(withdrawalRef.id, 'Could not reach MarzPay.');
+      return res.status(502).json({ success: false, error: 'Could not reach the payment provider. Your balance has been restored — please try again.' });
+    }
+
+    if (!marzRes.ok || (marzData.status !== true && marzData.status !== 'success' && !marzData.success)) {
+      const errMsg = marzData?.message || 'MarzPay declined the withdrawal.';
+      await refundWithdrawal(withdrawalRef.id, errMsg, marzData);
+      return res.status(400).json({ success: false, error: errMsg + ' Your balance has been restored.' });
+    }
+
+    const txId = marzData?.data?.transaction?.uuid || marzData?.data?.id || null;
+    await withdrawalRef.update({ marzpayTransactionId: txId, status: 'processing', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    if (txId) pollMarzpayWithdrawalStatus(withdrawalRef.id, txId).catch(e => console.error('[poll-withdraw] error:', e.message));
+
+    res.json({ success: true, withdrawalId: withdrawalRef.id, amountSent, feeAmount });
+  } catch (e) {
+    console.error('[wallet/withdraw] error:', e);
+    res.status(500).json({ success: false, error: 'Internal server error starting withdrawal.' });
+  }
+});
+
+// Refunds a reserved withdrawal back into the seller's wallet balance and
+// marks both the autoWithdrawals doc and its ledger row as failed. Used
+// when MarzPay rejects the request outright (before we even get a
+// transaction id to poll/webhook against).
+async function refundWithdrawal(withdrawalId, reason, rawResponse) {
+  const withdrawalRef = db.collection('autoWithdrawals').doc(withdrawalId);
+  const withdrawalSnap = await withdrawalRef.get();
+  if (!withdrawalSnap.exists) return;
+  const w = withdrawalSnap.data();
+  if (w.status === 'failed' || w.status === 'completed') return; // idempotency guard
+
+  await withdrawalRef.update({
+    status: 'failed', failureReason: reason || 'Withdrawal failed.',
+    rawWebhook: rawResponse ? JSON.stringify(rawResponse).slice(0, 2000) : null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  const walletRef = db.collection('wallets').doc(w.userId);
+  const txSnap = await db.collection('walletTransactions')
+    .where('withdrawalId', '==', withdrawalId).limit(1).get();
+
+  await db.runTransaction(async (tx) => {
+    const walletSnap = await tx.get(walletRef);
+    const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+    const newBalance = (current.balance || 0) + w.amountRequested;
+    tx.set(walletRef, { balance: newBalance, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    if (!txSnap.empty) {
+      tx.update(txSnap.docs[0].ref, {
+        status: 'failed', description: `Withdrawal failed — refunded (${reason || 'declined'})`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+  });
+
+  await db.collection('userNotifications').add({
+    userId: w.userId, type: 'withdrawalFailed',
+    message: `Your withdrawal of UGX ${w.amountRequested.toLocaleString()} failed and has been refunded to your wallet. Reason: ${reason || 'declined'}`,
+    link: `wallet.html`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+// Marks a withdrawal (already sent to MarzPay, now confirmed) as completed —
+// increments totalWithdrawn, does NOT touch balance again (it was already
+// deducted at request time). Called from both the webhook and the poller,
+// same dual-path backstop pattern as applyPaymentStatus for collections.
+async function applyWithdrawalStatus(marzpayTxId, status, rawPayload) {
+  const snap = await db.collection('autoWithdrawals')
+    .where('marzpayTransactionId', '==', marzpayTxId).limit(1).get();
+  if (snap.empty) return false; // not a withdrawal tx — let the caller try collections instead
+
+  const doc = snap.docs[0];
+  const w = doc.data();
+  if (w.status === 'completed' || w.status === 'failed') return true; // idempotency guard
+
+  if (status === 'completed') {
+    await doc.ref.update({
+      status: 'completed', completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rawWebhook: JSON.stringify(rawPayload).slice(0, 3000)
+    });
+
+    const walletRef = db.collection('wallets').doc(w.userId);
+    const txSnap = await db.collection('walletTransactions')
+      .where('withdrawalId', '==', doc.id).limit(1).get();
+    await db.runTransaction(async (tx) => {
+      const walletSnap = await tx.get(walletRef);
+      const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+      tx.set(walletRef, {
+        totalWithdrawn: (current.totalWithdrawn || 0) + w.amountRequested,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      if (!txSnap.empty) {
+        tx.update(txSnap.docs[0].ref, { status: 'completed', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+    });
+
+    await db.collection('userNotifications').add({
+      userId: w.userId, type: 'withdrawalCompleted',
+      message: `UGX ${w.amountSent.toLocaleString()} sent to ${w.phone}. Withdrawal complete.`,
+      link: `wallet.html`, read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } else if (status === 'failed') {
+    await refundWithdrawal(doc.id, rawPayload?.data?.message || rawPayload?.message || 'Payment provider declined or reversed the transfer.', rawPayload);
+  }
+  return true;
+}
+
+async function pollMarzpayWithdrawalStatus(withdrawalDocId, txId) {
+  const maxAttempts = 25;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, 6000));
+    try {
+      const statusRes = await fetch(`${MARZPAY_BASE_URL}/send-money/${txId}`, {
+        headers: { 'Authorization': marzpayAuthHeader() }
+      });
+      if (!statusRes.ok) continue;
+      const statusData = await statusRes.json();
+      const status = extractStatus(statusData);
+      if (status === 'completed' || status === 'failed') {
+        await applyWithdrawalStatus(txId, status, statusData);
+        return;
+      }
+    } catch (e) {
+      console.error('[poll-withdraw] attempt error:', e.message);
+    }
+  }
+  console.warn('[poll-withdraw] gave up waiting for transaction', txId);
+}
+
+// GET /api/admin/wallet-settings — public read of the current withdrawal
+// fee so wallet.html can show "you'll receive X after fee" without needing
+// the admin token (fee percent is not secret).
+app.get('/api/admin/wallet-settings', async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const snap = await db.collection('siteConfig').doc('walletSettings').get();
+    const feePercent = (snap.exists && typeof snap.data().withdrawalFeePercent === 'number') ? snap.data().withdrawalFeePercent : null;
+    res.json({ success: true, withdrawalFeePercent: feePercent });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/admin/wallet-settings — admin sets (or clears) the withdrawal
+// fee percentage. Same X-Admin-Token pattern as /api/admin/payment-settings.
+app.post('/api/admin/wallet-settings', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { withdrawalFeePercent } = req.body || {};
+    let value = null;
+    if (withdrawalFeePercent !== null && withdrawalFeePercent !== undefined && withdrawalFeePercent !== '') {
+      value = Number(withdrawalFeePercent);
+      if (isNaN(value) || value < 0 || value > 100) {
+        return res.status(400).json({ success: false, error: 'Fee must be a number between 0 and 100.' });
+      }
+    }
+    await db.collection('siteConfig').doc('walletSettings').set({
+      withdrawalFeePercent: value,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────
 // 2. REAL DEVICE PUSH — processes the pendingPush queue via FCM Admin SDK
