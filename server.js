@@ -38,6 +38,21 @@
  *      premium payments). See IMPLEMENTATION_PLAN.md and
  *      ORDERS_DATA_MODEL.md at the project root for the full design.
  *
+ *   5. MULTI-CHANNEL NOTIFICATIONS (NEW — Email / SMS / WhatsApp / Telegram)
+ *      admin-notification-channels.html lets the admin paste in EmailJS or
+ *      Infobip credentials (email), Infobip credentials (SMS), WhatsApp
+ *      Cloud API or Green API credentials (WhatsApp), and a Telegram bot
+ *      token — plus a price + duration (or "free") per channel. Users pay
+ *      for a channel through the same MarzPay automatic-payment flow as
+ *      Premium plans (POST /api/payments/collect with purpose:
+ *      'notifChannel'), or the admin can manually grant/revoke access per
+ *      user (POST /api/admin/notification-access). No new env vars — all
+ *      of this is stored in Firestore (siteConfig/notificationChannels,
+ *      userNotificationAccess/{uid}) since, unlike MarzPay/Firebase, the
+ *      admin needs to change these from the UI without a redeploy. Device
+ *      push (FCM, section 2 above) stays free/unconditional regardless of
+ *      channel access, per spec.
+ *
  * ── Deploying on Render ─────────────────────────────────────────────────
  *   1. Push this file (+ package.json) to a repo, or create a new Render
  *      Web Service pointing at a repo containing it.
@@ -84,55 +99,6 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const fetch = global.fetch || require('node-fetch');
 const crypto = require('crypto');
-// ── Notification provider credentials ──────────────────────────────────
-// Provider secrets entered in Admin → API & Notifications are encrypted
-// before being stored in Firestore. Set NOTIFICATION_CREDENTIAL_KEY on Render
-// to a long random 32-byte key (base64 or hex). Never put provider secrets in
-// frontend code or siteConfig.
-function notificationCryptoKey() {
-  const raw = process.env.NOTIFICATION_CREDENTIAL_KEY || '';
-  if (!raw) return null;
-  try {
-    const b = Buffer.from(raw, /^[0-9a-fA-F]{64}$/.test(raw) ? 'hex' : 'base64');
-    return b.length === 32 ? b : crypto.createHash('sha256').update(raw).digest();
-  } catch (_) {
-    return crypto.createHash('sha256').update(raw).digest();
-  }
-}
-function encryptNotificationCredentials(value) {
-  const key = notificationCryptoKey();
-  if (!key) throw new Error('NOTIFICATION_CREDENTIAL_KEY is not configured on the server.');
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value || {}), 'utf8'), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { v: 1, alg: 'aes-256-gcm', iv: iv.toString('base64'), tag: tag.toString('base64'), data: ciphertext.toString('base64') };
-}
-function decryptNotificationCredentials(record) {
-  if (!record || !record.data) return {};
-  const key = notificationCryptoKey();
-  if (!key) throw new Error('NOTIFICATION_CREDENTIAL_KEY is not configured on the server.');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(record.iv, 'base64'));
-  decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
-  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(record.data, 'base64')), decipher.final()]).toString('utf8'));
-}
-async function getNotificationConfig() {
-  const snap = await db.collection('siteConfig').doc('notificationSettings').get();
-  return snap.exists ? (snap.data() || {}) : {};
-}
-function cleanProviderConfig(provider, input) {
-  const x = input && typeof input === 'object' ? input : {};
-  const out = {};
-  const allowed = {
-    email: ['provider','serviceId','templateId','publicKey','privateKey','apiKey','baseUrl','fromEmail','fromName'],
-    sms: ['provider','apiKey','baseUrl','sender'],
-    whatsapp: ['provider','apiToken','phoneNumberId','baseUrl','instanceId','token','sender'],
-    telegram: ['botToken','defaultChatId']
-  }[provider] || [];
-  for (const k of allowed) if (x[k] !== undefined && x[k] !== null && String(x[k]).trim() !== '') out[k] = String(x[k]).trim();
-  return out;
-}
-
 
 // ── Firebase Admin init ─────────────────────────────────────────────────
 // Uses a single FIREBASE_SERVICE_ACCOUNT env var holding the entire
@@ -187,21 +153,6 @@ const MARZPAY_BASE_URL = (process.env.MARZPAY_BASE_URL || 'https://wallet.wearem
 const MARZPAY_API_KEY = process.env.MARZPAY_API_KEY || '';
 const MARZPAY_API_SECRET = process.env.MARZPAY_API_SECRET || '';
 const PUBLIC_BACKEND_URL = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
-
-// The admin-configured payment backend URL is the canonical public URL for all
-// automatic payment callbacks. This keeps notifications and other payments
-// on the exact same Render server without hardcoding a deployment URL in code.
-async function getConfiguredBackendUrl() {
-  try {
-    if (db) {
-      const snap = await db.collection('siteConfig').doc('paymentSettings').get();
-      const x = snap.exists ? snap.data() || {} : {};
-      const u = (x.premium?.backendUrl || x.deals?.backendUrl || x.backendUrl || '').replace(/\/+$/, '');
-      if (u) return u;
-    }
-  } catch (e) { console.warn('[backend-url] Could not read admin payment backend URL:', e.message); }
-  return PUBLIC_BACKEND_URL;
-}
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
 
 function marzpayAuthHeader() {
@@ -767,8 +718,7 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
     // useful in our own logs/records, but send MarzPay the UUID it demands.
     const ref = crypto.randomUUID();
     const internalRef = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
-    const configuredBackendUrl = await getConfiguredBackendUrl();
-    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
+    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     const paymentRef = db.collection('autoPayments').doc();
     await paymentRef.set({
@@ -871,322 +821,6 @@ app.post('/api/orders/:orderId/verify-pickup', requireAuth, async (req, res) => 
   }
 });
 
-
-// ─────────────────────────────────────────────────────────────────────────
-// NOTIFICATION CHANNELS — pricing, subscriptions, admin provider settings
-// ─────────────────────────────────────────────────────────────────────────
-
-const NOTIF_CHANNELS = ['email','sms','whatsapp','telegram'];
-
-async function activateNotificationSubscription(payment) {
-  if (!payment.userId || !NOTIF_CHANNELS.includes(payment.notificationChannel)) return;
-  const channel = payment.notificationChannel;
-  await db.collection('notificationAccess').doc(`${payment.userId}_${channel}`).set({
-    userId: payment.userId, channel, status: 'active', source: 'payment',
-    paymentId: payment.id || null, amountPaid: Number(payment.amount || 0),
-    activatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-  }, { merge: true });
-  await db.collection('userNotifications').add({
-    userId: payment.userId, type: 'notificationChannelActivated',
-    message: `${channel[0].toUpperCase()+channel.slice(1)} notifications are now active on your LowHub account.`,
-    link: 'notification-settings.html', read: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
-}
-
-async function hasNotificationAccess(userId, channel) {
-  const s = await db.collection('notificationAccess').doc(`${userId}_${channel}`).get();
-  return s.exists && s.data().status === 'active';
-}
-
-function providerReady(channel, c) {
-  const x=c||{};
-  if(channel==='email') return x.provider==='emailjs' ? !!(x.serviceId&&x.templateId&&x.publicKey) : !!(x.apiKey&&x.fromEmail);
-  if(channel==='sms') return !!(x.apiKey&&x.sender);
-  if(channel==='whatsapp') return x.provider==='green-api' ? !!(x.instanceId&&x.token) : !!(x.phoneNumberId&&x.apiToken);
-  if(channel==='telegram') return !!x.botToken;
-  return false;
-}
-
-app.get('/api/notifications/config', async (req, res) => {
-  if (!requireDb(res)) return;
-  try {
-    const c = await getNotificationConfig();
-    const prices = {};
-    for (const ch of NOTIF_CHANNELS) {
-      const v = c.prices?.[ch];
-      prices[ch] = Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : 0;
-    }
-    res.json({ success: true, prices, enabled: c.enabled || Object.fromEntries(NOTIF_CHANNELS.map(x => [x,true])) });
-  } catch (e) {
-    res.status(500).json({ success:false, error:'Could not load notification settings.' });
-  }
-});
-
-app.get('/api/notifications/status', requireAuth, async (req, res) => {
-  if (!requireDb(res)) return;
-  try {
-    const c = await getNotificationConfig();
-    const out = {};
-    const pref = (await db.collection('notificationPreferences').doc(req.authUid).get()).data() || {};
-    const creds={};
-    for(const ch of NOTIF_CHANNELS){ if(c.credentials?.[ch]){ try{ creds[ch]=decryptNotificationCredentials(c.credentials[ch]); }catch(_){} } }
-    for (const ch of NOTIF_CHANNELS) {
-      const access = await hasNotificationAccess(req.authUid, ch);
-      out[ch] = { active: access, enabled: pref[ch]?.enabled !== false, price: Number(c.prices?.[ch] || 0), configured: providerReady(ch, creds[ch]) };
-    }
-    res.json({ success:true, channels:out });
-  } catch(e) { res.status(500).json({success:false,error:'Could not load notification status.'}); }
-});
-
-app.post('/api/notifications/preferences', requireAuth, async (req, res) => {
-  if (!requireDb(res)) return;
-  try {
-    const body = req.body || {};
-    const allowed = {};
-    for (const ch of NOTIF_CHANNELS) {
-      if (body[ch] && typeof body[ch] === 'object') {
-        allowed[ch] = { enabled: body[ch].enabled !== false };
-        if (body[ch].telegramChatId) allowed[ch].telegramChatId = String(body[ch].telegramChatId).trim().slice(0,100);
-      }
-    }
-    await db.collection('notificationPreferences').doc(req.authUid).set({
-      ...allowed, updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge:true });
-    res.json({success:true});
-  } catch(e) { res.status(500).json({success:false,error:'Could not save notification preferences.'}); }
-});
-
-app.post('/api/notifications/subscribe', requireAuth, async (req, res) => {
-  if (!requireDb(res)) return;
-  try {
-    const { channel, phone } = req.body || {};
-    if (!NOTIF_CHANNELS.includes(channel)) return res.status(400).json({success:false,error:'Invalid notification channel.'});
-    const c = await getNotificationConfig();
-    const enabled = c.enabled?.[channel] !== false;
-    if (!enabled) return res.status(400).json({success:false,error:'This notification method is currently unavailable.'});
-    let channelCreds={};
-    if(c.credentials?.[channel]){ try{channelCreds=decryptNotificationCredentials(c.credentials[channel]);}catch(_){} }
-    if(!providerReady(channel, channelCreds)) return res.status(400).json({success:false,error:`${channel[0].toUpperCase()+channel.slice(1)} notifications are not configured by LowHub yet.`});
-    const price = Math.max(0, Number(c.prices?.[channel] || 0));
-    if (await hasNotificationAccess(req.authUid, channel)) return res.json({success:true, active:true, free:price===0});
-    if (price === 0) {
-      await db.collection('notificationAccess').doc(`${req.authUid}_${channel}`).set({
-        userId:req.authUid, channel, status:'active', source:'free',
-        amountPaid:0, activatedAt:admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt:admin.firestore.FieldValue.serverTimestamp()
-      }, {merge:true});
-      return res.json({success:true, active:true, free:true});
-    }
-    if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) return res.status(500).json({success:false,error:'Automatic payments are not configured on the server yet.'});
-    const normalizedPhone = normalizePhone(phone);
-    if (!isValidUgandaPhone(normalizedPhone)) return res.status(400).json({success:false,error:'Enter a valid Ugandan mobile money number.'});
-    const ref = crypto.randomUUID();
-    const internalRef = `LH-NOTIF-${channel}-${req.authUid}-${Date.now()}`;
-    const configuredBackendUrl = await getConfiguredBackendUrl();
-    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
-    const paymentRef = db.collection('autoPayments').doc();
-    await paymentRef.set({
-      userId:req.authUid, userEmail:req.authEmail||'', userName:'',
-      phone:normalizedPhone, amount:price, reference:ref, internalRef,
-      purpose:'notification', notificationChannel:channel,
-      status:'pending', provider:'marzpay', marzpayTransactionId:null,
-      createdAt:admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt:admin.firestore.FieldValue.serverTimestamp()
-    });
-    const marzRes = await fetch(`${MARZPAY_BASE_URL}/collect-money`, {
-      method:'POST',
-      headers:{'Content-Type':'application/json','Authorization':marzpayAuthHeader()},
-      body:JSON.stringify({phone_number:'+'+normalizedPhone, amount:price, country:'UG', reference:ref,
-        description:`LowHub ${channel} notifications`, ...(callbackUrl?{callback_url:callbackUrl}:{})})
-    });
-    const marzData = await marzRes.json();
-    if (!marzRes.ok || (marzData.status !== true && marzData.status !== 'success' && !marzData.success)) {
-      const msg=marzData?.message||'MarzPay declined the request.';
-      await paymentRef.update({status:'failed',failureReason:msg,updatedAt:admin.firestore.FieldValue.serverTimestamp()});
-      return res.status(400).json({success:false,error:msg});
-    }
-    const txId=marzData?.data?.transaction?.uuid||marzData?.data?.id||marzData?.data?.collection_id||null;
-    await paymentRef.update({marzpayTransactionId:txId,status:'processing',updatedAt:admin.firestore.FieldValue.serverTimestamp()});
-    if (txId && typeof pollMarzpayPaymentStatus === 'function') pollMarzpayStatus(paymentRef.id, txId).catch(()=>{});
-    res.json({success:true,pending:true,paymentId:paymentRef.id});
-  } catch(e) {
-    console.error('[notifications/subscribe]',e);
-    res.status(500).json({success:false,error:'Could not start notification payment.'});
-  }
-});
-
-// Admin API credential settings. Secrets are encrypted server-side.
-app.get('/api/admin/notification-settings', async (req,res)=>{
-  if(!requireDb(res)) return;
-  if(!checkAdminToken(req,res)) return;
-  try {
-    const c=await getNotificationConfig();
-    const masked={};
-    for(const ch of NOTIF_CHANNELS){
-      const enc=c.credentials?.[ch];
-      let exists=!!enc;
-      let cfg={};
-      if(exists){ try { const d=decryptNotificationCredentials(enc); for(const k of Object.keys(d)) cfg[k]=/token|key|secret|password/i.test(k)?'••••••••':d[k]; } catch(_) { cfg={configured:true}; } }
-      masked[ch]={configured:exists,config:cfg};
-    }
-    res.json({success:true,prices:c.prices||{},enabled:c.enabled||{},providers:masked});
-  }catch(e){res.status(500).json({success:false,error:e.message});}
-});
-
-app.post('/api/admin/notification-settings', async (req,res)=>{
-  if(!requireDb(res)) return;
-  if(!checkAdminToken(req,res)) return;
-  try{
-    const body=req.body||{}, prices={}, enabled={};
-    for(const ch of NOTIF_CHANNELS){
-      const price=Number(body.prices?.[ch]||0);
-      if(!Number.isFinite(price)||price<0) return res.status(400).json({success:false,error:`Invalid ${ch} price.`});
-      prices[ch]=Math.round(price); enabled[ch]=body.enabled?.[ch]!==false;
-    }
-    const credentials={};
-    const old=(await getNotificationConfig()).credentials||{};
-    for(const ch of NOTIF_CHANNELS){
-      const supplied=cleanProviderConfig(ch,body.providers?.[ch]);
-      let previous={};
-      if(old[ch]){ try{previous=decryptNotificationCredentials(old[ch]);}catch(_){} }
-      const merged={...previous,...supplied};
-      if(Object.keys(merged).length) credentials[ch]=encryptNotificationCredentials(merged);
-    }
-    await db.collection('siteConfig').doc('notificationSettings').set({prices,enabled,credentials,updatedAt:admin.firestore.FieldValue.serverTimestamp()});
-    res.json({success:true});
-  }catch(e){console.error('[admin/notification-settings]',e);res.status(500).json({success:false,error:e.message});}
-});
-
-app.post('/api/admin/test-notification', async(req,res)=>{
-  if(!requireDb(res)) return;
-  if(!checkAdminToken(req,res)) return;
-  try{
-    const {channel,destination}=req.body||{};
-    if(!NOTIF_CHANNELS.includes(channel)||!destination) return res.status(400).json({success:false,error:'Choose a channel and enter a destination.'});
-    const cfg=await getNotificationConfig();
-    let c={}; if(cfg.credentials?.[channel]) c=decryptNotificationCredentials(cfg.credentials[channel]);
-    if(!providerReady(channel,c)) return res.status(400).json({success:false,error:`${channel[0].toUpperCase()+channel.slice(1)} provider credentials are incomplete.`});
-    const title='LowHub test notification', body='This is a test notification from your LowHub notification setup.';
-    let r;
-    if(channel==='email') {
-      if(c.provider==='emailjs') r=await fetch('https://api.emailjs.com/api/v1.0/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service_id:c.serviceId,template_id:c.templateId,user_id:c.publicKey,accessToken:c.privateKey||undefined,template_params:{to_email:String(destination).trim(),to_name:'LowHub Admin',subject:title,message:body,link:''}})});
-      else { const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,''); r=await fetch(base+'/email/3/send',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:String(destination).trim()}],from:c.fromEmail,subject:title,content:{text:body}}]})}); }
-    } else if(channel==='sms') {
-      const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,''); r=await fetch(base+'/sms/2/text/advanced',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:normalizePhone(destination)}],from:c.sender,content:{text:body}}]})});
-    } else if(channel==='whatsapp') {
-      let url,headers,bodyData;
-      if(c.provider==='green-api'){url=`https://api.green-api.com/waInstance${c.instanceId}/sendMessage/${c.token}`;headers={'Content-Type':'application/json'};bodyData={chatId:normalizePhone(destination)+'@c.us',message:body};}
-      else {const base=(c.baseUrl||'https://graph.facebook.com/v20.0').replace(/\/$/,'');url=`${base}/${c.phoneNumberId}/messages`;headers={'Authorization':'Bearer '+c.apiToken,'Content-Type':'application/json'};bodyData={messaging_product:'whatsapp',to:normalizePhone(destination),type:'text',text:{body}};}
-      r=await fetch(url,{method:'POST',headers,body:JSON.stringify(bodyData)});
-    } else {
-      r=await fetch(`https://api.telegram.org/bot${c.botToken}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:String(destination).trim(),text:`${title}\n\n${body}`})});
-    }
-    const raw=await r.text();
-    if(!r.ok) return res.status(400).json({success:false,error:`Provider rejected the test (${r.status}). ${raw.slice(0,400)}`});
-    res.json({success:true});
-  }catch(e){console.error('[admin/test-notification]',e);res.status(500).json({success:false,error:e.message||'Test failed.'});}
-});
-
-app.post('/api/admin/notification-access', async(req,res)=>{
-  if(!requireDb(res)) return;
-  if(!checkAdminToken(req,res)) return;
-  try{
-    const {email,uid,channel,action}=req.body||{};
-    if(!NOTIF_CHANNELS.includes(channel)||!['allow','remove'].includes(action)) return res.status(400).json({success:false,error:'Invalid channel or action.'});
-    let userId=uid;
-    if(!userId && email) userId=(await admin.auth().getUserByEmail(String(email).trim())).uid;
-    if(!userId) return res.status(400).json({success:false,error:'Enter a user email or UID.'});
-    const ref=db.collection('notificationAccess').doc(`${userId}_${channel}`);
-    if(action==='allow') await ref.set({userId,channel,status:'active',source:'admin',amountPaid:0,updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
-    else await ref.set({userId,channel,status:'revoked',source:'admin',updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
-    res.json({success:true,userId,channel,action});
-  }catch(e){res.status(404).json({success:false,error:e.message||'User not found.'});}
-});
-
-// Delivery worker. It watches normal in-app notification documents and sends
-// the same event through every channel the user has paid for / been allowed
-// to use. Device push remains independent and free.
-async function sendExternalNotification(userId, notificationId, n) {
-  const prefSnap=await db.collection('notificationPreferences').doc(userId).get();
-  const pref=prefSnap.exists?prefSnap.data()||{}:{};
-  const accessDocs=await Promise.all(NOTIF_CHANNELS.map(ch=>db.collection('notificationAccess').doc(`${userId}_${ch}`).get()));
-  const access=Object.fromEntries(NOTIF_CHANNELS.map((ch,i)=>[ch,accessDocs[i].exists&&accessDocs[i].data().status==='active']));
-  const user=await admin.auth().getUser(userId);
-  const ud=(await db.collection('users').doc(userId).get()).data()||{};
-  const cfg=await getNotificationConfig();
-  const creds={};
-  for(const ch of NOTIF_CHANNELS) if(cfg.credentials?.[ch]) { try{creds[ch]=decryptNotificationCredentials(cfg.credentials[ch]);}catch(e){console.error('[notif decrypt]',ch,e.message);} }
-  const title=n.title||'LowHub Notification', body=n.message||n.body||'';
-  const results={};
-
-  if(access.email && pref.email?.enabled!==false && user.email && creds.email){
-    try{
-      const c=creds.email;
-      if(c.provider==='emailjs'){
-        const r=await fetch('https://api.emailjs.com/api/v1.0/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-          service_id:c.serviceId,template_id:c.templateId,user_id:c.publicKey,accessToken:c.privateKey||undefined,
-          template_params:{to_email:user.email,to_name:user.displayName||'',subject:title,message:body,link:n.link||''}
-        })}); results.email=r.ok?'sent':'failed';
-      } else {
-        const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,'');
-        const r=await fetch(base+'/email/3/send',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:user.email}],from:c.fromEmail,subject:title,content:{text:body}}]})});
-        results.email=r.ok?'sent':'failed';
-      }
-    }catch(e){results.email='failed';}
-  }
-  const phone=ud.phone||ud.phoneNumber||user.phoneNumber||null;
-  if(access.sms && pref.sms?.enabled!==false && phone && creds.sms){
-    try{
-      const c=creds.sms, base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,'');
-      const r=await fetch(base+'/sms/2/text/advanced',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:normalizePhone(phone)}],from:c.sender,content:{text:`${title}: ${body}`}}]})});
-      results.sms=r.ok?'sent':'failed';
-    }catch(e){results.sms='failed';}
-  }
-  if(access.whatsapp && pref.whatsapp?.enabled!==false && phone && creds.whatsapp){
-    try{
-      const c=creds.whatsapp; let url,headers,bodyData;
-      if(c.provider==='green-api'){
-        url=`https://api.green-api.com/waInstance${c.instanceId}/sendMessage/${c.token}`;
-        headers={'Content-Type':'application/json'}; bodyData={chatId:normalizePhone(phone)+'@c.us',message:`*${title}*\n${body}`};
-      } else {
-        const base=(c.baseUrl||'https://graph.facebook.com/v20.0').replace(/\/$/,'');
-        url=`${base}/${c.phoneNumberId}/messages`; headers={'Authorization':'Bearer '+c.apiToken,'Content-Type':'application/json'};
-        bodyData={messaging_product:'whatsapp',to:normalizePhone(phone),type:'text',text:{body:`${title}\n${body}`}};
-      }
-      const r=await fetch(url,{method:'POST',headers,body:JSON.stringify(bodyData)}); results.whatsapp=r.ok?'sent':'failed';
-    }catch(e){results.whatsapp='failed';}
-  }
-  if(access.telegram && pref.telegram?.enabled!==false && creds.telegram){
-    try{
-      const c=creds.telegram, chatId=pref.telegram?.telegramChatId||c.defaultChatId;
-      if(chatId){ const r=await fetch(`https://api.telegram.org/bot${c.botToken}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text:`${title}\n\n${body}`})}); results.telegram=r.ok?'sent':'failed'; }
-    }catch(e){results.telegram='failed';}
-  }
-  return results;
-}
-
-const notificationWorkerStartedAt = Date.now();
-let notificationWorkerBusy=false;
-async function processExternalNotifications(){
-  if(notificationWorkerBusy||!db)return;
-  notificationWorkerBusy=true;
-  try{
-    const snap=await db.collection('userNotifications').orderBy('createdAt','desc').limit(100).get();
-    for(const d of snap.docs){
-      const created=d.data().createdAt?.toDate?.()?.getTime?.() || 0;
-      if(created < notificationWorkerStartedAt || d.data().externalDeliveryProcessed===true) continue;
-      try{
-        const results=await sendExternalNotification(d.data().userId,d.id,d.data());
-        await d.ref.update({externalDeliveryProcessed:true,externalDeliveryResults:results,externalDeliveryAt:admin.firestore.FieldValue.serverTimestamp()});
-      }catch(e){console.error('[notification-worker]',d.id,e.message);}
-    }
-  }catch(e){ /* no-op; older docs without the field are intentionally not processed */ }
-  finally{notificationWorkerBusy=false;}
-}
-setInterval(processExternalNotifications, 7000);
-
 // ─────────────────────────────────────────────────────────────────────────
 // 1. AUTOMATIC PAYMENTS — MarzPay
 // ─────────────────────────────────────────────────────────────────────────
@@ -1206,19 +840,29 @@ app.post('/api/payments/collect', async (req, res) => {
       // needs to create the live deal on success — selected ads, heading,
       // content, discount label, duration — since this collect call is the
       // only place that data exists before payment confirms.
-      purpose, dealPayload
+      purpose, dealPayload,
+      // Notification-channel fields (purpose: 'notifChannel'). notifChannel
+      // is one of 'email'|'sms'|'whatsapp'|'telegram'; notifChannelDays
+      // comes from the admin's configured duration for that channel (see
+      // /api/admin/notification-channels) and is echoed back by the
+      // frontend at checkout time.
+      notifChannel, notifChannelDays
     } = req.body || {};
 
     const isDeal = purpose === 'deal';
-    // planKey doubles as "what are we paying for" for premium; for deals we
-    // just need an identifying label, so fall back to a fixed one.
-    const itemKey = isDeal ? 'deal' : planKey;
+    const isNotifChannel = purpose === 'notifChannel';
+    // planKey doubles as "what are we paying for" for premium; for deals/
+    // notifChannel purchases we just need an identifying label.
+    const itemKey = isDeal ? 'deal' : isNotifChannel ? `notif-${notifChannel}` : planKey;
 
-    if (!userId || !phone || !amount || (!isDeal && !planKey)) {
+    if (!userId || !phone || !amount || (!isDeal && !isNotifChannel && !planKey)) {
       return res.status(400).json({ success: false, error: 'Missing required fields (userId, phone, amount, planKey).' });
     }
     if (isDeal && (!dealPayload || !Array.isArray(dealPayload.adIds) || !dealPayload.adIds.length)) {
       return res.status(400).json({ success: false, error: 'Missing deal details (selected ads).' });
+    }
+    if (isNotifChannel && !NOTIF_CHANNELS.includes(notifChannel)) {
+      return res.status(400).json({ success: false, error: `notifChannel must be one of: ${NOTIF_CHANNELS.join(', ')}` });
     }
     if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) {
       return res.status(500).json({ success: false, error: 'Automatic payments are not configured on the server yet (missing MarzPay credentials).' });
@@ -1236,8 +880,7 @@ app.post('/api/payments/collect', async (req, res) => {
     const ref = (reference && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference))
       ? reference
       : crypto.randomUUID();
-    const configuredBackendUrl = await getConfiguredBackendUrl();
-    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
+    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     // Create the Firestore tracking doc FIRST (status: pending) so the
     // frontend has something to poll even before MarzPay responds.
@@ -1245,10 +888,12 @@ app.post('/api/payments/collect', async (req, res) => {
     await paymentRef.set({
       userId, userEmail: userEmail || '', userName: userName || '',
       phone: normalizedPhone, amount, reference: ref, internalRef,
-      purpose: isDeal ? 'deal' : 'premium',
+      purpose: isDeal ? 'deal' : isNotifChannel ? 'notifChannel' : 'premium',
       planKey: planKey || null, planName: planName || '',
       planDays: planDays || null,
       dealPayload: isDeal ? dealPayload : null,
+      notifChannel: isNotifChannel ? notifChannel : null,
+      notifChannelDays: isNotifChannel ? (notifChannelDays || 30) : null,
       status: 'pending',
       provider: 'marzpay',
       marzpayTransactionId: null,
@@ -1275,7 +920,7 @@ app.post('/api/payments/collect', async (req, res) => {
           amount: amount,
           country: 'UG',
           reference: ref,
-          description: isDeal ? `LowHub deal submission (${dealPayload.adIds.length} ad(s))` : `LowHub ${planName || planKey} plan`,
+          description: isDeal ? `LowHub deal submission (${dealPayload.adIds.length} ad(s))` : isNotifChannel ? `LowHub ${notifChannel} notifications` : `LowHub ${planName || planKey} plan`,
           ...(callbackUrl ? { callback_url: callbackUrl } : {})
         })
       });
@@ -1409,8 +1054,8 @@ async function applyPaymentStatus(marzpayTxId, status, rawPayload) {
       await activateDealFromPayment(data);
     } else if (data.purpose === 'order') {
       await activateOrderFromPayment(data);
-    } else if (data.purpose === 'notification') {
-      await activateNotificationSubscription({...data, id: doc.id});
+    } else if (data.purpose === 'notifChannel') {
+      await activateNotifChannelFromPayment(data);
     } else {
       await activatePremiumPlan(data);
     }
@@ -1613,6 +1258,51 @@ async function activatePremiumPlan(payment) {
     title: 'Payment Successful',
     body: `Your ${payment.planName || payment.planKey} plan is now active!`,
     link: '/dashboard.html',
+    sent: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+// Grants a user access to one notification channel (email/sms/whatsapp/
+// telegram) once its automatic MarzPay payment is confirmed. Mirrors
+// activatePremiumPlan's expiry-window shape but writes into
+// userNotificationAccess/{uid}.{channel} instead of a premiumPlans doc,
+// since a user can hold several of these at once (independent per channel).
+async function activateNotifChannelFromPayment(payment) {
+  const channel = payment.notifChannel;
+  if (!NOTIF_CHANNELS.includes(channel)) {
+    console.warn('[notif-channel] activateNotifChannelFromPayment called with invalid channel', payment);
+    return;
+  }
+  const days = payment.notifChannelDays || 30;
+  const expires = new Date(Date.now() + days * 86400000);
+
+  await db.collection('userNotificationAccess').doc(payment.userId).set({
+    [channel]: {
+      active: true,
+      source: 'payment',
+      expiresAt: expires,
+      activatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }
+  }, { merge: true });
+
+  const channelLabel = channel.charAt(0).toUpperCase() + channel.slice(1);
+  await db.collection('userNotifications').add({
+    userId: payment.userId,
+    type: 'notifChannelActivated',
+    title: 'Payment Successful',
+    message: `${channelLabel} notifications are now active on your account for ${days} day(s).`,
+    link: 'notification-settings.html',
+    read: false,
+    outboundProcessed: true, // avoid immediately re-billing/looping this confirmation through the very channel just paid for
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+
+  await db.collection('pendingPush').add({
+    userId: payment.userId,
+    title: 'Payment Successful',
+    body: `${channelLabel} notifications are now active!`,
+    link: '/notification-settings.html',
     sent: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp()
   });
@@ -1860,8 +1550,7 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
 
     const ref = crypto.randomUUID();
     const internalRef = `LH-WD-${uid}-${Date.now()}`;
-    const configuredBackendUrl = await getConfiguredBackendUrl();
-    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
+    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
 
     await withdrawalRef.set({
       userId: uid, userEmail: req.authEmail || '', userName: '',
@@ -2239,6 +1928,468 @@ async function sendToAllUsers(title, body, link) {
 
 // Poll the queue every 15 seconds.
 setInterval(processPendingPush, 15000);
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2B. MULTI-CHANNEL NOTIFICATIONS — Email / SMS / WhatsApp / Telegram
+// ─────────────────────────────────────────────────────────────────────────
+// Design mirrors the pendingPush queue above as closely as possible:
+//
+//   - siteConfig/notificationChannels holds, per channel (email/sms/
+//     whatsapp/telegram): { enabled, free, price, days, provider,
+//     credentials:{...} }. Only ever read/written from THIS server via the
+//     admin-token-protected endpoints below — the browser never receives
+//     the credentials back in plaintext (see GET /api/admin/notification-
+//     channels, which strips secret values before responding).
+//
+//   - userNotificationAccess/{uid} holds, per channel, whether that user
+//     currently has access: { active, expiresAt, source }. `source` is
+//     'payment' (via MarzPay, same automatic flow as Premium/Deals) or
+//     'manual' (admin toggled it on/off by hand). A channel with
+//     channelConfig.free === true is treated as active for every user
+//     automatically, no document needed.
+//
+//   - Every real notification in this app already funnels through one of
+//     two writes: db.collection('userNotifications').add({...}) (server)
+//     or firebase.firestore().collection('userNotifications').add({...})
+//     (browser, in lh-push.js / admin-notifications.html). Rather than
+//     touching every one of those ~15 call sites, this poller watches that
+//     SAME collection for new docs and fans each one out across whichever
+//     channels the target user currently has access to. Device push
+//     (FCM, via pendingPush above) is untouched and stays free/unconditional
+//     per the spec — this is a separate, additive delivery path.
+//
+//   - Real provider credentials (EmailJS/Infobip/Green API/WhatsApp Cloud/
+//     Telegram bot token) live ONLY inside the credentials object saved by
+//     the admin endpoints below, stored in Firestore. This intentionally
+//     differs from MarzPay/Firebase (Render env vars) because these are
+//     per-deployment, admin-editable, non-infrastructure secrets the admin
+//     needs to change from the UI without a redeploy — same tradeoff
+//     admin.html already makes for e.g. AI settings. Firestore security
+//     rules must keep siteConfig/notificationChannels unreadable by normal
+//     authenticated users (see firestore.rules — add a matching rule).
+// ─────────────────────────────────────────────────────────────────────────
+
+const NOTIF_CHANNELS = ['email', 'sms', 'whatsapp', 'telegram'];
+
+async function getChannelConfig() {
+  if (!db) return {};
+  const snap = await db.collection('siteConfig').doc('notificationChannels').get();
+  return snap.exists ? (snap.data() || {}) : {};
+}
+
+// Does this user currently have active access to `channel`? `free` only
+// means "no payment required" — it does NOT mean "on for everyone by
+// default". A user must still have explicitly opted in (via the free
+// toggle in notification-settings.html, a completed payment, or an admin
+// manual grant) before anything is actually sent to them. This was
+// previously short-circuiting on cfg.free alone, which would have emailed/
+// texted/messaged every single user the moment the admin marked a channel
+// free, regardless of whether that person ever visited their notification
+// settings or entered contact details for it — the opposite of "only
+// deliver through channels the user themselves turned on".
+async function userHasChannelAccess(userId, channel, channelCfg) {
+  const cfg = channelCfg[channel] || {};
+  if (!cfg.enabled) return false;
+  if (!userId) return false;
+  try {
+    const accSnap = await db.collection('userNotificationAccess').doc(userId).get();
+    if (!accSnap.exists) return false;
+    const acc = (accSnap.data() || {})[channel];
+    if (!acc || !acc.active) return false;
+    // Free channels are opted into via the toggle in notification-settings.html
+    // (source: 'user-free-toggle') and never expire on their own — the
+    // user's own switch is the only thing that turns them off again. Paid
+    // and manually-granted access still honor expiresAt below.
+    if (cfg.free && acc.source === 'user-free-toggle') return true;
+    if (!acc.expiresAt) return true; // indefinite manual grant
+    const exp = typeof acc.expiresAt.toDate === 'function' ? acc.expiresAt.toDate() : new Date(acc.expiresAt);
+    return exp.getTime() >= Date.now();
+  } catch (e) {
+    console.error('[notif-access] lookup failed:', e.message);
+    return false;
+  }
+}
+
+// ── Provider senders ────────────────────────────────────────────────────
+// Each returns nothing on success and throws on failure — caller logs the
+// failure onto the outboundNotifications doc, same pattern as pendingPush.
+
+async function sendEmailViaProvider(cfg, toEmail, title, message) {
+  if (!toEmail) throw new Error('User has no email on file.');
+  const c = cfg.credentials || {};
+  if (cfg.provider === 'infobip') {
+    if (!c.infobipBaseUrl || !c.infobipApiKey || !c.infobipSenderEmail) throw new Error('Infobip email credentials incomplete.');
+    const url = `${c.infobipBaseUrl.replace(/\/+$/, '')}/email/3/send`;
+    const form = new URLSearchParams();
+    form.append('from', c.infobipSenderEmail);
+    form.append('to', toEmail);
+    form.append('subject', title || 'LowHub notification');
+    form.append('text', message || '');
+    const r = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Authorization': `App ${c.infobipApiKey}` },
+      body: form
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data?.requestError?.serviceException?.text || `Infobip email failed (${r.status}).`);
+  } else {
+    // Default: EmailJS (https://www.emailjs.com/docs/rest-api/send/)
+    if (!c.emailjsServiceId || !c.emailjsTemplateId || !c.emailjsPublicKey) throw new Error('EmailJS credentials incomplete.');
+    const r = await fetchWithTimeout('https://api.emailjs.com/api/v1.0/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        service_id: c.emailjsServiceId,
+        template_id: c.emailjsTemplateId,
+        user_id: c.emailjsPublicKey,
+        accessToken: c.emailjsPrivateKey || undefined,
+        template_params: { to_email: toEmail, subject: title || 'LowHub notification', message: message || '' }
+      })
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      throw new Error(`EmailJS failed (${r.status}): ${text.slice(0, 200)}`);
+    }
+  }
+}
+
+async function sendSmsViaProvider(cfg, toPhone, message) {
+  if (!toPhone) throw new Error('User has no phone on file.');
+  const c = cfg.credentials || {};
+  if (!c.infobipBaseUrl || !c.infobipApiKey || !c.infobipSenderId) throw new Error('Infobip SMS credentials incomplete.');
+  const normalized = normalizePhone(toPhone);
+  const url = `${c.infobipBaseUrl.replace(/\/+$/, '')}/sms/2/text/advanced`;
+  const r = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Authorization': `App ${c.infobipApiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: [{ from: c.infobipSenderId, destinations: [{ to: normalized }], text: message || '' }]
+    })
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.requestError?.serviceException?.text || `Infobip SMS failed (${r.status}).`);
+}
+
+async function sendWhatsAppViaProvider(cfg, toPhone, message) {
+  if (!toPhone) throw new Error('User has no phone on file.');
+  const c = cfg.credentials || {};
+  const normalized = normalizePhone(toPhone);
+  if (cfg.provider === 'green-api') {
+    if (!c.greenApiInstanceId || !c.greenApiToken) throw new Error('Green API credentials incomplete.');
+    const url = `https://api.green-api.com/waInstance${c.greenApiInstanceId}/sendMessage/${c.greenApiToken}`;
+    const r = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatId: `${normalized}@c.us`, message: message || '' })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data?.error || `Green API failed (${r.status}).`);
+  } else {
+    // Default: official WhatsApp Cloud API (Meta)
+    if (!c.waPhoneNumberId || !c.waAccessToken) throw new Error('WhatsApp Cloud API credentials incomplete.');
+    const url = `https://graph.facebook.com/v20.0/${c.waPhoneNumberId}/messages`;
+    const r = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${c.waAccessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: normalized,
+        type: 'text',
+        text: { body: message || '' }
+      })
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data?.error?.message || `WhatsApp Cloud API failed (${r.status}).`);
+  }
+}
+
+async function sendTelegramViaProvider(cfg, chatId, title, message) {
+  if (!chatId) throw new Error('User has not linked a Telegram chat ID.');
+  const c = cfg.credentials || {};
+  if (!c.telegramBotToken) throw new Error('Telegram bot token not configured.');
+  const url = `https://api.telegram.org/bot${c.telegramBotToken}/sendMessage`;
+  const text = title ? `*${title}*\n${message || ''}` : (message || '');
+  const r = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' })
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.ok === false) throw new Error(data?.description || `Telegram send failed (${r.status}).`);
+}
+
+// Watches userNotifications for docs not yet fanned out to external
+// channels (outboundProcessed !== true) and delivers to every channel the
+// target user has access to. Marks the doc processed either way so it's
+// never retried forever on a permanently-broken config.
+async function processOutboundNotifications() {
+  if (!db) return;
+  try {
+    // Docs created by the BACKEND explicitly set outboundProcessed: false
+    // (or true, to opt out — see e.g. activateNotifChannelFromPayment).
+    // Docs created by the BROWSER (lh-push.js, admin-notifications.html)
+    // never set this field at all, since that pre-dates this feature and
+    // client code cannot be relied on to add it correctly everywhere. A
+    // single `where('outboundProcessed','==',false)` query would silently
+    // skip every client-created doc forever. Firestore also can't combine
+    // an equality and a "field missing" clause in one query, so this runs
+    // both queries and merges results, de-duplicated by doc id.
+    const [explicitSnap, legacySnap] = await Promise.all([
+      db.collection('userNotifications').where('outboundProcessed', '==', false).limit(25).get(),
+      db.collection('userNotifications').orderBy('createdAt', 'desc').limit(50).get()
+    ]);
+    const seen = new Set();
+    const docs = [];
+    for (const d of explicitSnap.docs) { if (!seen.has(d.id)) { seen.add(d.id); docs.push(d); } }
+    for (const d of legacySnap.docs) {
+      if (seen.has(d.id)) continue;
+      if (d.data().outboundProcessed === undefined) { seen.add(d.id); docs.push(d); }
+    }
+    if (!docs.length) return;
+    const snap = { empty: false, docs, forEach: (fn) => docs.forEach(fn) };
+
+    const channelCfg = await getChannelConfig();
+    const anyEnabled = NOTIF_CHANNELS.some(ch => channelCfg[ch] && channelCfg[ch].enabled);
+    if (!anyEnabled) {
+      // Nothing configured yet — mark processed so this query stops
+      // re-scanning the same docs every 20s until the admin sets it up.
+      const batch = db.batch();
+      snap.forEach(d => batch.update(d.ref, { outboundProcessed: true }));
+      await batch.commit();
+      return;
+    }
+
+    for (const doc of snap.docs) {
+      const n = doc.data();
+      const results = {};
+      try {
+        if (!n.userId) { await doc.ref.update({ outboundProcessed: true }); continue; }
+        const userSnap = await db.collection('users').doc(n.userId).get();
+        const user = userSnap.exists ? userSnap.data() : {};
+        const title = n.title || 'LowHub';
+        const message = n.message || '';
+
+        for (const channel of NOTIF_CHANNELS) {
+          const cfg = channelCfg[channel];
+          if (!cfg || !cfg.enabled) continue;
+          const hasAccess = await userHasChannelAccess(n.userId, channel, channelCfg);
+          if (!hasAccess) continue;
+          try {
+            if (channel === 'email') await sendEmailViaProvider(cfg, user.email, title, message);
+            else if (channel === 'sms') await sendSmsViaProvider(cfg, user.phone, message);
+            else if (channel === 'whatsapp') await sendWhatsAppViaProvider(cfg, user.phone, message);
+            else if (channel === 'telegram') await sendTelegramViaProvider(cfg, user.telegramChatId, title, message);
+            results[channel] = 'sent';
+          } catch (chErr) {
+            console.error(`[notif-outbound] ${channel} failed for user ${n.userId}:`, chErr.message);
+            results[channel] = 'failed: ' + chErr.message;
+          }
+        }
+      } catch (e) {
+        console.error('[notif-outbound] doc error:', e.message);
+      }
+      await doc.ref.update({ outboundProcessed: true, outboundResults: results, outboundAt: admin.firestore.FieldValue.serverTimestamp() });
+    }
+  } catch (e) {
+    console.error('[notif-outbound] queue processing error:', e.message);
+  }
+}
+
+// Poll every 20 seconds — separate cadence from device push since these
+// calls hit external paid APIs and don't need push's tighter latency.
+setInterval(processOutboundNotifications, 20000);
+
+// GET /api/admin/notification-channels — returns current settings with
+// credentials REDACTED (booleans only: whether each secret field is set),
+// so the admin UI can show "already configured" without ever re-displaying
+// the actual key. The admin re-enters credentials only when changing them.
+app.get('/api/admin/notification-channels', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const cfg = await getChannelConfig();
+    const redacted = {};
+    for (const ch of NOTIF_CHANNELS) {
+      const c = cfg[ch] || {};
+      const creds = c.credentials || {};
+      const credsPresent = {};
+      for (const k of Object.keys(creds)) credsPresent[k] = !!creds[k];
+      redacted[ch] = {
+        enabled: !!c.enabled, free: !!c.free,
+        price: typeof c.price === 'number' ? c.price : null,
+        days: typeof c.days === 'number' ? c.days : null,
+        provider: c.provider || null,
+        credentialsPresent: credsPresent
+      };
+    }
+    res.json({ success: true, channels: redacted });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/admin/notification-channels — save one channel's settings.
+// Body: { channel: 'email'|'sms'|'whatsapp'|'telegram', enabled, free,
+//          price, days, provider, credentials: {...} }
+// A credentials field left blank/undefined by the admin is NOT overwritten
+// (so re-saving the price doesn't wipe out an already-saved API key) —
+// only keys actually present in the request body's credentials object are
+// merged in, individually.
+app.post('/api/admin/notification-channels', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { channel, enabled, free, price, days, provider, credentials } = req.body || {};
+    if (!NOTIF_CHANNELS.includes(channel)) {
+      return res.status(400).json({ success: false, error: `channel must be one of: ${NOTIF_CHANNELS.join(', ')}` });
+    }
+    const docRef = db.collection('siteConfig').doc('notificationChannels');
+    const existingSnap = await docRef.get();
+    const existing = (existingSnap.exists ? existingSnap.data() : {}) || {};
+    const existingChannel = existing[channel] || {};
+    const existingCreds = existingChannel.credentials || {};
+
+    const mergedCreds = { ...existingCreds };
+    if (credentials && typeof credentials === 'object') {
+      for (const [k, v] of Object.entries(credentials)) {
+        if (v !== undefined && v !== null && String(v).trim() !== '') mergedCreds[k] = String(v).trim();
+      }
+    }
+
+    let cleanPrice = existingChannel.price ?? null;
+    if (price !== undefined) {
+      if (price === null || price === '') cleanPrice = null;
+      else {
+        const n = Number(price);
+        if (isNaN(n) || n < 0) return res.status(400).json({ success: false, error: 'price must be a non-negative number.' });
+        cleanPrice = n;
+      }
+    }
+    let cleanDays = existingChannel.days ?? null;
+    if (days !== undefined) {
+      if (days === null || days === '') cleanDays = null;
+      else {
+        const n = Number(days);
+        if (isNaN(n) || n < 1) return res.status(400).json({ success: false, error: 'days must be a positive number.' });
+        cleanDays = n;
+      }
+    }
+
+    const finalEnabled = enabled !== undefined ? !!enabled : !!existingChannel.enabled;
+    const finalFree = free !== undefined ? !!free : !!existingChannel.free;
+    const finalProvider = provider !== undefined ? (provider || null) : (existingChannel.provider || null);
+
+    await docRef.set({
+      [channel]: {
+        enabled: finalEnabled,
+        free: finalFree,
+        price: cleanPrice,
+        days: cleanDays,
+        provider: finalProvider,
+        credentials: mergedCreds
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    // Also mirror the NON-secret fields into a public doc that the browser
+    // (notification-settings.html) is allowed to read directly — see
+    // firestore.rules: siteConfig/notificationChannelsPublic is
+    // `allow read: if true`, unlike the private doc above. This keeps
+    // secrets fully server-side while still letting the pricing UI render
+    // without adding another backend round trip just to show a price.
+    // telegramBotUsername is intentionally included here (not a secret —
+    // it's the @handle users message to link their account).
+    const publicRef = db.collection('siteConfig').doc('notificationChannelsPublic');
+    const publicEntry = {
+      enabled: finalEnabled, free: finalFree, price: cleanPrice, days: cleanDays
+    };
+    if (channel === 'telegram') publicEntry.telegramBotUsername = mergedCreds.telegramBotUsername || null;
+    await publicRef.set({ [channel]: publicEntry, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/notifications/toggle-free-channel — lets a SIGNED-IN USER
+// (not admin) turn a channel on/off for themselves, but ONLY when that
+// channel is marked `free` by the admin. requireAuth derives the caller's
+// uid from their Firebase ID token — the request body's userId is never
+// trusted, same rule the orders endpoints already follow. This exists so
+// userNotificationAccess/{uid} can stay fully server-write-only in
+// firestore.rules (no client writes at all) while still letting the free-
+// toggle switch in notification-settings.html work without going through
+// the paid/manual grant machinery.
+app.post('/api/notifications/toggle-free-channel', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { channel, on } = req.body || {};
+    if (!NOTIF_CHANNELS.includes(channel)) {
+      return res.status(400).json({ success: false, error: `channel must be one of: ${NOTIF_CHANNELS.join(', ')}` });
+    }
+    const channelCfg = await getChannelConfig();
+    const cfg = channelCfg[channel];
+    if (!cfg || !cfg.enabled || !cfg.free) {
+      return res.status(403).json({ success: false, error: 'This channel is not free — payment or an admin grant is required.' });
+    }
+    await db.collection('userNotificationAccess').doc(req.authUid).set({
+      [channel]: { active: !!on, source: 'user-free-toggle', updatedAt: admin.firestore.FieldValue.serverTimestamp() }
+    }, { merge: true });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /api/admin/notification-access?userId=... — admin looks up one
+// user's current per-channel access (for the manual grant/revoke UI).
+app.get('/api/admin/notification-access', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ success: false, error: 'userId query param required.' });
+    const snap = await db.collection('userNotificationAccess').doc(userId).get();
+    res.json({ success: true, access: snap.exists ? snap.data() : {} });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/admin/notification-access — admin manually grants or revokes
+// one channel for one user. Body: { userId, channel, action: 'grant'|'revoke', days? }
+// A manual grant with no `days` given is treated as indefinite (no expiresAt).
+app.post('/api/admin/notification-access', async (req, res) => {
+  if (!requireDb(res)) return;
+  if (!checkAdminToken(req, res)) return;
+  try {
+    const { userId, channel, action, days } = req.body || {};
+    if (!userId || !NOTIF_CHANNELS.includes(channel) || !['grant', 'revoke'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'userId, valid channel, and action (grant|revoke) are required.' });
+    }
+    const docRef = db.collection('userNotificationAccess').doc(userId);
+    if (action === 'revoke') {
+      await docRef.set({ [channel]: { active: false, source: 'manual', updatedAt: admin.firestore.FieldValue.serverTimestamp() } }, { merge: true });
+    } else {
+      const entry = { active: true, source: 'manual', updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+      if (days) {
+        const n = Number(days);
+        if (!isNaN(n) && n > 0) entry.expiresAt = new Date(Date.now() + n * 86400000);
+      }
+      await docRef.set({ [channel]: entry }, { merge: true });
+      await db.collection('userNotifications').add({
+        userId, type: 'notifChannelGranted', title: 'Notifications Enabled',
+        message: `An admin has enabled ${channel} notifications for your account.`,
+        link: 'notification-settings.html', read: false, outboundProcessed: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────
 // ADMIN FINANCE + PICKUP OPERATIONS
