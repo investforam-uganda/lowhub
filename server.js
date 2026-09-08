@@ -84,6 +84,55 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const fetch = global.fetch || require('node-fetch');
 const crypto = require('crypto');
+// ── Notification provider credentials ──────────────────────────────────
+// Provider secrets entered in Admin → API & Notifications are encrypted
+// before being stored in Firestore. Set NOTIFICATION_CREDENTIAL_KEY on Render
+// to a long random 32-byte key (base64 or hex). Never put provider secrets in
+// frontend code or siteConfig.
+function notificationCryptoKey() {
+  const raw = process.env.NOTIFICATION_CREDENTIAL_KEY || '';
+  if (!raw) return null;
+  try {
+    const b = Buffer.from(raw, /^[0-9a-fA-F]{64}$/.test(raw) ? 'hex' : 'base64');
+    return b.length === 32 ? b : crypto.createHash('sha256').update(raw).digest();
+  } catch (_) {
+    return crypto.createHash('sha256').update(raw).digest();
+  }
+}
+function encryptNotificationCredentials(value) {
+  const key = notificationCryptoKey();
+  if (!key) throw new Error('NOTIFICATION_CREDENTIAL_KEY is not configured on the server.');
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value || {}), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return { v: 1, alg: 'aes-256-gcm', iv: iv.toString('base64'), tag: tag.toString('base64'), data: ciphertext.toString('base64') };
+}
+function decryptNotificationCredentials(record) {
+  if (!record || !record.data) return {};
+  const key = notificationCryptoKey();
+  if (!key) throw new Error('NOTIFICATION_CREDENTIAL_KEY is not configured on the server.');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(record.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(record.data, 'base64')), decipher.final()]).toString('utf8'));
+}
+async function getNotificationConfig() {
+  const snap = await db.collection('siteConfig').doc('notificationSettings').get();
+  return snap.exists ? (snap.data() || {}) : {};
+}
+function cleanProviderConfig(provider, input) {
+  const x = input && typeof input === 'object' ? input : {};
+  const out = {};
+  const allowed = {
+    email: ['provider','serviceId','templateId','publicKey','privateKey','apiKey','baseUrl','fromEmail','fromName'],
+    sms: ['provider','apiKey','baseUrl','sender'],
+    whatsapp: ['provider','apiToken','phoneNumberId','baseUrl','instanceId','token','sender'],
+    telegram: ['botToken','defaultChatId']
+  }[provider] || [];
+  for (const k of allowed) if (x[k] !== undefined && x[k] !== null && String(x[k]).trim() !== '') out[k] = String(x[k]).trim();
+  return out;
+}
+
 
 // ── Firebase Admin init ─────────────────────────────────────────────────
 // Uses a single FIREBASE_SERVICE_ACCOUNT env var holding the entire
@@ -138,11 +187,32 @@ const MARZPAY_BASE_URL = (process.env.MARZPAY_BASE_URL || 'https://wallet.wearem
 const MARZPAY_API_KEY = process.env.MARZPAY_API_KEY || '';
 const MARZPAY_API_SECRET = process.env.MARZPAY_API_SECRET || '';
 const PUBLIC_BACKEND_URL = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
+
+// The admin-configured payment backend URL is the canonical public URL for all
+// automatic payment callbacks. This keeps notifications and other payments
+// on the exact same Render server without hardcoding a deployment URL in code.
+async function getConfiguredBackendUrl() {
+  try {
+    if (db) {
+      const snap = await db.collection('siteConfig').doc('paymentSettings').get();
+      const x = snap.exists ? snap.data() || {} : {};
+      const u = (x.premium?.backendUrl || x.deals?.backendUrl || x.backendUrl || '').replace(/\/+$/, '');
+      if (u) return u;
+    }
+  } catch (e) { console.warn('[backend-url] Could not read admin payment backend URL:', e.message); }
+  return PUBLIC_BACKEND_URL;
+}
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
 
 function marzpayAuthHeader() {
   const creds = Buffer.from(`${MARZPAY_API_KEY}:${MARZPAY_API_SECRET}`).toString('base64');
   return `Basic ${creds}`;
+}
+
+function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
 }
 
 function requireDb(res) {
@@ -697,7 +767,8 @@ app.post('/api/orders/:orderId/pay', requireAuth, async (req, res) => {
     // useful in our own logs/records, but send MarzPay the UUID it demands.
     const ref = crypto.randomUUID();
     const internalRef = `LH-ORDER-${order.orderNumber}-${Date.now()}`;
-    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
+    const configuredBackendUrl = await getConfiguredBackendUrl();
+    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
 
     const paymentRef = db.collection('autoPayments').doc();
     await paymentRef.set({
@@ -800,6 +871,322 @@ app.post('/api/orders/:orderId/verify-pickup', requireAuth, async (req, res) => 
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────
+// NOTIFICATION CHANNELS — pricing, subscriptions, admin provider settings
+// ─────────────────────────────────────────────────────────────────────────
+
+const NOTIF_CHANNELS = ['email','sms','whatsapp','telegram'];
+
+async function activateNotificationSubscription(payment) {
+  if (!payment.userId || !NOTIF_CHANNELS.includes(payment.notificationChannel)) return;
+  const channel = payment.notificationChannel;
+  await db.collection('notificationAccess').doc(`${payment.userId}_${channel}`).set({
+    userId: payment.userId, channel, status: 'active', source: 'payment',
+    paymentId: payment.id || null, amountPaid: Number(payment.amount || 0),
+    activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+  await db.collection('userNotifications').add({
+    userId: payment.userId, type: 'notificationChannelActivated',
+    message: `${channel[0].toUpperCase()+channel.slice(1)} notifications are now active on your LowHub account.`,
+    link: 'notification-settings.html', read: false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+}
+
+async function hasNotificationAccess(userId, channel) {
+  const s = await db.collection('notificationAccess').doc(`${userId}_${channel}`).get();
+  return s.exists && s.data().status === 'active';
+}
+
+function providerReady(channel, c) {
+  const x=c||{};
+  if(channel==='email') return x.provider==='emailjs' ? !!(x.serviceId&&x.templateId&&x.publicKey) : !!(x.apiKey&&x.fromEmail);
+  if(channel==='sms') return !!(x.apiKey&&x.sender);
+  if(channel==='whatsapp') return x.provider==='green-api' ? !!(x.instanceId&&x.token) : !!(x.phoneNumberId&&x.apiToken);
+  if(channel==='telegram') return !!x.botToken;
+  return false;
+}
+
+app.get('/api/notifications/config', async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const c = await getNotificationConfig();
+    const prices = {};
+    for (const ch of NOTIF_CHANNELS) {
+      const v = c.prices?.[ch];
+      prices[ch] = Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : 0;
+    }
+    res.json({ success: true, prices, enabled: c.enabled || Object.fromEntries(NOTIF_CHANNELS.map(x => [x,true])) });
+  } catch (e) {
+    res.status(500).json({ success:false, error:'Could not load notification settings.' });
+  }
+});
+
+app.get('/api/notifications/status', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const c = await getNotificationConfig();
+    const out = {};
+    const pref = (await db.collection('notificationPreferences').doc(req.authUid).get()).data() || {};
+    const creds={};
+    for(const ch of NOTIF_CHANNELS){ if(c.credentials?.[ch]){ try{ creds[ch]=decryptNotificationCredentials(c.credentials[ch]); }catch(_){} } }
+    for (const ch of NOTIF_CHANNELS) {
+      const access = await hasNotificationAccess(req.authUid, ch);
+      out[ch] = { active: access, enabled: pref[ch]?.enabled !== false, price: Number(c.prices?.[ch] || 0), configured: providerReady(ch, creds[ch]) };
+    }
+    res.json({ success:true, channels:out });
+  } catch(e) { res.status(500).json({success:false,error:'Could not load notification status.'}); }
+});
+
+app.post('/api/notifications/preferences', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const body = req.body || {};
+    const allowed = {};
+    for (const ch of NOTIF_CHANNELS) {
+      if (body[ch] && typeof body[ch] === 'object') {
+        allowed[ch] = { enabled: body[ch].enabled !== false };
+        if (body[ch].telegramChatId) allowed[ch].telegramChatId = String(body[ch].telegramChatId).trim().slice(0,100);
+      }
+    }
+    await db.collection('notificationPreferences').doc(req.authUid).set({
+      ...allowed, updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge:true });
+    res.json({success:true});
+  } catch(e) { res.status(500).json({success:false,error:'Could not save notification preferences.'}); }
+});
+
+app.post('/api/notifications/subscribe', requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { channel, phone } = req.body || {};
+    if (!NOTIF_CHANNELS.includes(channel)) return res.status(400).json({success:false,error:'Invalid notification channel.'});
+    const c = await getNotificationConfig();
+    const enabled = c.enabled?.[channel] !== false;
+    if (!enabled) return res.status(400).json({success:false,error:'This notification method is currently unavailable.'});
+    let channelCreds={};
+    if(c.credentials?.[channel]){ try{channelCreds=decryptNotificationCredentials(c.credentials[channel]);}catch(_){} }
+    if(!providerReady(channel, channelCreds)) return res.status(400).json({success:false,error:`${channel[0].toUpperCase()+channel.slice(1)} notifications are not configured by LowHub yet.`});
+    const price = Math.max(0, Number(c.prices?.[channel] || 0));
+    if (await hasNotificationAccess(req.authUid, channel)) return res.json({success:true, active:true, free:price===0});
+    if (price === 0) {
+      await db.collection('notificationAccess').doc(`${req.authUid}_${channel}`).set({
+        userId:req.authUid, channel, status:'active', source:'free',
+        amountPaid:0, activatedAt:admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt:admin.firestore.FieldValue.serverTimestamp()
+      }, {merge:true});
+      return res.json({success:true, active:true, free:true});
+    }
+    if (!MARZPAY_API_KEY || !MARZPAY_API_SECRET) return res.status(500).json({success:false,error:'Automatic payments are not configured on the server yet.'});
+    const normalizedPhone = normalizePhone(phone);
+    if (!isValidUgandaPhone(normalizedPhone)) return res.status(400).json({success:false,error:'Enter a valid Ugandan mobile money number.'});
+    const ref = crypto.randomUUID();
+    const internalRef = `LH-NOTIF-${channel}-${req.authUid}-${Date.now()}`;
+    const configuredBackendUrl = await getConfiguredBackendUrl();
+    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
+    const paymentRef = db.collection('autoPayments').doc();
+    await paymentRef.set({
+      userId:req.authUid, userEmail:req.authEmail||'', userName:'',
+      phone:normalizedPhone, amount:price, reference:ref, internalRef,
+      purpose:'notification', notificationChannel:channel,
+      status:'pending', provider:'marzpay', marzpayTransactionId:null,
+      createdAt:admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt:admin.firestore.FieldValue.serverTimestamp()
+    });
+    const marzRes = await fetch(`${MARZPAY_BASE_URL}/collect-money`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':marzpayAuthHeader()},
+      body:JSON.stringify({phone_number:'+'+normalizedPhone, amount:price, country:'UG', reference:ref,
+        description:`LowHub ${channel} notifications`, ...(callbackUrl?{callback_url:callbackUrl}:{})})
+    });
+    const marzData = await marzRes.json();
+    if (!marzRes.ok || (marzData.status !== true && marzData.status !== 'success' && !marzData.success)) {
+      const msg=marzData?.message||'MarzPay declined the request.';
+      await paymentRef.update({status:'failed',failureReason:msg,updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+      return res.status(400).json({success:false,error:msg});
+    }
+    const txId=marzData?.data?.transaction?.uuid||marzData?.data?.id||marzData?.data?.collection_id||null;
+    await paymentRef.update({marzpayTransactionId:txId,status:'processing',updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    if (txId && typeof pollMarzpayPaymentStatus === 'function') pollMarzpayStatus(paymentRef.id, txId).catch(()=>{});
+    res.json({success:true,pending:true,paymentId:paymentRef.id});
+  } catch(e) {
+    console.error('[notifications/subscribe]',e);
+    res.status(500).json({success:false,error:'Could not start notification payment.'});
+  }
+});
+
+// Admin API credential settings. Secrets are encrypted server-side.
+app.get('/api/admin/notification-settings', async (req,res)=>{
+  if(!requireDb(res)) return;
+  if(!checkAdminToken(req,res)) return;
+  try {
+    const c=await getNotificationConfig();
+    const masked={};
+    for(const ch of NOTIF_CHANNELS){
+      const enc=c.credentials?.[ch];
+      let exists=!!enc;
+      let cfg={};
+      if(exists){ try { const d=decryptNotificationCredentials(enc); for(const k of Object.keys(d)) cfg[k]=/token|key|secret|password/i.test(k)?'••••••••':d[k]; } catch(_) { cfg={configured:true}; } }
+      masked[ch]={configured:exists,config:cfg};
+    }
+    res.json({success:true,prices:c.prices||{},enabled:c.enabled||{},providers:masked});
+  }catch(e){res.status(500).json({success:false,error:e.message});}
+});
+
+app.post('/api/admin/notification-settings', async (req,res)=>{
+  if(!requireDb(res)) return;
+  if(!checkAdminToken(req,res)) return;
+  try{
+    const body=req.body||{}, prices={}, enabled={};
+    for(const ch of NOTIF_CHANNELS){
+      const price=Number(body.prices?.[ch]||0);
+      if(!Number.isFinite(price)||price<0) return res.status(400).json({success:false,error:`Invalid ${ch} price.`});
+      prices[ch]=Math.round(price); enabled[ch]=body.enabled?.[ch]!==false;
+    }
+    const credentials={};
+    const old=(await getNotificationConfig()).credentials||{};
+    for(const ch of NOTIF_CHANNELS){
+      const supplied=cleanProviderConfig(ch,body.providers?.[ch]);
+      let previous={};
+      if(old[ch]){ try{previous=decryptNotificationCredentials(old[ch]);}catch(_){} }
+      const merged={...previous,...supplied};
+      if(Object.keys(merged).length) credentials[ch]=encryptNotificationCredentials(merged);
+    }
+    await db.collection('siteConfig').doc('notificationSettings').set({prices,enabled,credentials,updatedAt:admin.firestore.FieldValue.serverTimestamp()});
+    res.json({success:true});
+  }catch(e){console.error('[admin/notification-settings]',e);res.status(500).json({success:false,error:e.message});}
+});
+
+app.post('/api/admin/test-notification', async(req,res)=>{
+  if(!requireDb(res)) return;
+  if(!checkAdminToken(req,res)) return;
+  try{
+    const {channel,destination}=req.body||{};
+    if(!NOTIF_CHANNELS.includes(channel)||!destination) return res.status(400).json({success:false,error:'Choose a channel and enter a destination.'});
+    const cfg=await getNotificationConfig();
+    let c={}; if(cfg.credentials?.[channel]) c=decryptNotificationCredentials(cfg.credentials[channel]);
+    if(!providerReady(channel,c)) return res.status(400).json({success:false,error:`${channel[0].toUpperCase()+channel.slice(1)} provider credentials are incomplete.`});
+    const title='LowHub test notification', body='This is a test notification from your LowHub notification setup.';
+    let r;
+    if(channel==='email') {
+      if(c.provider==='emailjs') r=await fetch('https://api.emailjs.com/api/v1.0/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service_id:c.serviceId,template_id:c.templateId,user_id:c.publicKey,accessToken:c.privateKey||undefined,template_params:{to_email:String(destination).trim(),to_name:'LowHub Admin',subject:title,message:body,link:''}})});
+      else { const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,''); r=await fetch(base+'/email/3/send',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:String(destination).trim()}],from:c.fromEmail,subject:title,content:{text:body}}]})}); }
+    } else if(channel==='sms') {
+      const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,''); r=await fetch(base+'/sms/2/text/advanced',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:normalizePhone(destination)}],from:c.sender,content:{text:body}}]})});
+    } else if(channel==='whatsapp') {
+      let url,headers,bodyData;
+      if(c.provider==='green-api'){url=`https://api.green-api.com/waInstance${c.instanceId}/sendMessage/${c.token}`;headers={'Content-Type':'application/json'};bodyData={chatId:normalizePhone(destination)+'@c.us',message:body};}
+      else {const base=(c.baseUrl||'https://graph.facebook.com/v20.0').replace(/\/$/,'');url=`${base}/${c.phoneNumberId}/messages`;headers={'Authorization':'Bearer '+c.apiToken,'Content-Type':'application/json'};bodyData={messaging_product:'whatsapp',to:normalizePhone(destination),type:'text',text:{body}};}
+      r=await fetch(url,{method:'POST',headers,body:JSON.stringify(bodyData)});
+    } else {
+      r=await fetch(`https://api.telegram.org/bot${c.botToken}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:String(destination).trim(),text:`${title}\n\n${body}`})});
+    }
+    const raw=await r.text();
+    if(!r.ok) return res.status(400).json({success:false,error:`Provider rejected the test (${r.status}). ${raw.slice(0,400)}`});
+    res.json({success:true});
+  }catch(e){console.error('[admin/test-notification]',e);res.status(500).json({success:false,error:e.message||'Test failed.'});}
+});
+
+app.post('/api/admin/notification-access', async(req,res)=>{
+  if(!requireDb(res)) return;
+  if(!checkAdminToken(req,res)) return;
+  try{
+    const {email,uid,channel,action}=req.body||{};
+    if(!NOTIF_CHANNELS.includes(channel)||!['allow','remove'].includes(action)) return res.status(400).json({success:false,error:'Invalid channel or action.'});
+    let userId=uid;
+    if(!userId && email) userId=(await admin.auth().getUserByEmail(String(email).trim())).uid;
+    if(!userId) return res.status(400).json({success:false,error:'Enter a user email or UID.'});
+    const ref=db.collection('notificationAccess').doc(`${userId}_${channel}`);
+    if(action==='allow') await ref.set({userId,channel,status:'active',source:'admin',amountPaid:0,updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
+    else await ref.set({userId,channel,status:'revoked',source:'admin',updatedAt:admin.firestore.FieldValue.serverTimestamp()},{merge:true});
+    res.json({success:true,userId,channel,action});
+  }catch(e){res.status(404).json({success:false,error:e.message||'User not found.'});}
+});
+
+// Delivery worker. It watches normal in-app notification documents and sends
+// the same event through every channel the user has paid for / been allowed
+// to use. Device push remains independent and free.
+async function sendExternalNotification(userId, notificationId, n) {
+  const prefSnap=await db.collection('notificationPreferences').doc(userId).get();
+  const pref=prefSnap.exists?prefSnap.data()||{}:{};
+  const accessDocs=await Promise.all(NOTIF_CHANNELS.map(ch=>db.collection('notificationAccess').doc(`${userId}_${ch}`).get()));
+  const access=Object.fromEntries(NOTIF_CHANNELS.map((ch,i)=>[ch,accessDocs[i].exists&&accessDocs[i].data().status==='active']));
+  const user=await admin.auth().getUser(userId);
+  const ud=(await db.collection('users').doc(userId).get()).data()||{};
+  const cfg=await getNotificationConfig();
+  const creds={};
+  for(const ch of NOTIF_CHANNELS) if(cfg.credentials?.[ch]) { try{creds[ch]=decryptNotificationCredentials(cfg.credentials[ch]);}catch(e){console.error('[notif decrypt]',ch,e.message);} }
+  const title=n.title||'LowHub Notification', body=n.message||n.body||'';
+  const results={};
+
+  if(access.email && pref.email?.enabled!==false && user.email && creds.email){
+    try{
+      const c=creds.email;
+      if(c.provider==='emailjs'){
+        const r=await fetch('https://api.emailjs.com/api/v1.0/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          service_id:c.serviceId,template_id:c.templateId,user_id:c.publicKey,accessToken:c.privateKey||undefined,
+          template_params:{to_email:user.email,to_name:user.displayName||'',subject:title,message:body,link:n.link||''}
+        })}); results.email=r.ok?'sent':'failed';
+      } else {
+        const base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,'');
+        const r=await fetch(base+'/email/3/send',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:user.email}],from:c.fromEmail,subject:title,content:{text:body}}]})});
+        results.email=r.ok?'sent':'failed';
+      }
+    }catch(e){results.email='failed';}
+  }
+  const phone=ud.phone||ud.phoneNumber||user.phoneNumber||null;
+  if(access.sms && pref.sms?.enabled!==false && phone && creds.sms){
+    try{
+      const c=creds.sms, base=(c.baseUrl||'https://api.infobip.com').replace(/\/$/,'');
+      const r=await fetch(base+'/sms/2/text/advanced',{method:'POST',headers:{'Authorization':'App '+c.apiKey,'Content-Type':'application/json'},body:JSON.stringify({messages:[{destinations:[{to:normalizePhone(phone)}],from:c.sender,content:{text:`${title}: ${body}`}}]})});
+      results.sms=r.ok?'sent':'failed';
+    }catch(e){results.sms='failed';}
+  }
+  if(access.whatsapp && pref.whatsapp?.enabled!==false && phone && creds.whatsapp){
+    try{
+      const c=creds.whatsapp; let url,headers,bodyData;
+      if(c.provider==='green-api'){
+        url=`https://api.green-api.com/waInstance${c.instanceId}/sendMessage/${c.token}`;
+        headers={'Content-Type':'application/json'}; bodyData={chatId:normalizePhone(phone)+'@c.us',message:`*${title}*\n${body}`};
+      } else {
+        const base=(c.baseUrl||'https://graph.facebook.com/v20.0').replace(/\/$/,'');
+        url=`${base}/${c.phoneNumberId}/messages`; headers={'Authorization':'Bearer '+c.apiToken,'Content-Type':'application/json'};
+        bodyData={messaging_product:'whatsapp',to:normalizePhone(phone),type:'text',text:{body:`${title}\n${body}`}};
+      }
+      const r=await fetch(url,{method:'POST',headers,body:JSON.stringify(bodyData)}); results.whatsapp=r.ok?'sent':'failed';
+    }catch(e){results.whatsapp='failed';}
+  }
+  if(access.telegram && pref.telegram?.enabled!==false && creds.telegram){
+    try{
+      const c=creds.telegram, chatId=pref.telegram?.telegramChatId||c.defaultChatId;
+      if(chatId){ const r=await fetch(`https://api.telegram.org/bot${c.botToken}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text:`${title}\n\n${body}`})}); results.telegram=r.ok?'sent':'failed'; }
+    }catch(e){results.telegram='failed';}
+  }
+  return results;
+}
+
+const notificationWorkerStartedAt = Date.now();
+let notificationWorkerBusy=false;
+async function processExternalNotifications(){
+  if(notificationWorkerBusy||!db)return;
+  notificationWorkerBusy=true;
+  try{
+    const snap=await db.collection('userNotifications').orderBy('createdAt','desc').limit(100).get();
+    for(const d of snap.docs){
+      const created=d.data().createdAt?.toDate?.()?.getTime?.() || 0;
+      if(created < notificationWorkerStartedAt || d.data().externalDeliveryProcessed===true) continue;
+      try{
+        const results=await sendExternalNotification(d.data().userId,d.id,d.data());
+        await d.ref.update({externalDeliveryProcessed:true,externalDeliveryResults:results,externalDeliveryAt:admin.firestore.FieldValue.serverTimestamp()});
+      }catch(e){console.error('[notification-worker]',d.id,e.message);}
+    }
+  }catch(e){ /* no-op; older docs without the field are intentionally not processed */ }
+  finally{notificationWorkerBusy=false;}
+}
+setInterval(processExternalNotifications, 7000);
+
 // ─────────────────────────────────────────────────────────────────────────
 // 1. AUTOMATIC PAYMENTS — MarzPay
 // ─────────────────────────────────────────────────────────────────────────
@@ -849,7 +1236,8 @@ app.post('/api/payments/collect', async (req, res) => {
     const ref = (reference && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference))
       ? reference
       : crypto.randomUUID();
-    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
+    const configuredBackendUrl = await getConfiguredBackendUrl();
+    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
 
     // Create the Firestore tracking doc FIRST (status: pending) so the
     // frontend has something to poll even before MarzPay responds.
@@ -1021,6 +1409,8 @@ async function applyPaymentStatus(marzpayTxId, status, rawPayload) {
       await activateDealFromPayment(data);
     } else if (data.purpose === 'order') {
       await activateOrderFromPayment(data);
+    } else if (data.purpose === 'notification') {
+      await activateNotificationSubscription({...data, id: doc.id});
     } else {
       await activatePremiumPlan(data);
     }
@@ -1470,7 +1860,8 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
 
     const ref = crypto.randomUUID();
     const internalRef = `LH-WD-${uid}-${Date.now()}`;
-    const callbackUrl = PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/api/payments/webhook` : undefined;
+    const configuredBackendUrl = await getConfiguredBackendUrl();
+    const callbackUrl = configuredBackendUrl ? `${configuredBackendUrl}/api/payments/webhook` : undefined;
 
     await withdrawalRef.set({
       userId: uid, userEmail: req.authEmail || '', userName: '',
@@ -1496,14 +1887,14 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
       // logged below), switch this one call to multipart/form-data — see
       // the commented alternative just below — without touching
       // collect-money, which is unrelated and already works.
-      marzRes = await fetch(`${MARZPAY_BASE_URL}/send-money`, {
+      marzRes = await fetchWithTimeout(`${MARZPAY_BASE_URL}/send-money`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': marzpayAuthHeader() },
         body: JSON.stringify({
           phone_number: marzPhone, amount: amountSent, country: 'UG', reference: ref,
           description: `LowHub wallet withdrawal`,
           ...(callbackUrl ? { callback_url: callbackUrl } : {})
-        })
+        }, 120000) // Give MarzPay up to 120 seconds to return a response.
         // Multipart alternative, if JSON gets rejected for this endpoint:
         //   const form = new URLSearchParams();
         //   form.append('phone_number', marzPhone); form.append('amount', String(amountSent));
@@ -1515,6 +1906,20 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
       marzData = await marzRes.json();
       console.log('[wallet/withdraw] MarzPay raw response:', JSON.stringify(marzData));
     } catch (fetchErr) {
+      // If MarzPay gives absolutely no HTTP response within 120 seconds,
+      // assume the transfer request reached the provider and complete the
+      // withdrawal. This is the requested safety fallback because the user
+      // may already have received the money even though MarzPay never
+      // returned its response to LowHub. A real provider error response is
+      // handled below and is NOT treated as a timeout.
+      if (fetchErr && fetchErr.name === 'AbortError') {
+        await completeWithdrawalFallback(withdrawalRef.id, {
+          fallback: true,
+          reason: 'MarzPay returned no response within 120 seconds.',
+          reference: ref
+        });
+        return res.status(200).json({ success: true, completed: true, withdrawalId: withdrawalRef.id, amountSent, feeAmount, message: 'MarzPay did not respond within 120 seconds. The withdrawal has been marked completed.' });
+      }
       await refundWithdrawal(withdrawalRef.id, 'Could not reach MarzPay.');
       return res.status(502).json({ success: false, error: 'Could not reach the payment provider. Your balance has been restored — please try again.' });
     }
@@ -1526,16 +1931,77 @@ app.post('/api/wallet/withdraw', requireAuth, async (req, res) => {
     }
 
     const txId = marzData?.data?.transaction?.uuid || marzData?.data?.id || null;
-    await withdrawalRef.update({ marzpayTransactionId: txId, status: 'processing', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    const providerStatus = marzData?.data?.transaction?.status || marzData?.transaction?.status || null;
+    // MarzPay's create response normally says `processing`. Even if a provider
+    // returns an unusual success response, only an explicit transaction-level
+    // completed status is allowed to complete the wallet withdrawal.
+    await withdrawalRef.update({ marzpayTransactionId: txId, status: 'processing', providerStatus: providerStatus || 'processing', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-    if (txId) pollMarzpayWithdrawalStatus(withdrawalRef.id, txId).catch(e => console.error('[poll-withdraw] error:', e.message));
+    if (txId) pollMarzpayWithdrawalStatus(withdrawalRef.id, txId, null).catch(e => console.error('[poll-withdraw] error:', e.message));
+    else pollMarzpayWithdrawalStatus(withdrawalRef.id, null, ref).catch(e => console.error('[poll-withdraw-reference] error:', e.message));
 
-    res.json({ success: true, withdrawalId: withdrawalRef.id, amountSent, feeAmount });
+    res.json({ success: true, pending: true, withdrawalId: withdrawalRef.id, amountSent, feeAmount, message: 'Withdrawal submitted and is processing. It will only be marked completed after MarzPay confirms the transfer.' });
   } catch (e) {
     console.error('[wallet/withdraw] error:', e);
     res.status(500).json({ success: false, error: 'Internal server error starting withdrawal.' });
   }
 });
+
+// Fallback completion used only when MarzPay gives no HTTP response for
+// the full 120-second initiation window. The balance was already reserved
+// at withdrawal creation, so completion only increments totalWithdrawn and
+// closes the ledger row. Idempotency prevents double counting if a webhook
+// races with this fallback.
+async function completeWithdrawalFallback(withdrawalId, rawPayload) {
+  const withdrawalRef = db.collection('autoWithdrawals').doc(withdrawalId);
+  const walletRef = db.collection('wallets');
+  const txQuery = db.collection('walletTransactions').where('withdrawalId', '==', withdrawalId).limit(1);
+
+  const result = await db.runTransaction(async (tx) => {
+    const withdrawalSnap = await tx.get(withdrawalRef);
+    if (!withdrawalSnap.exists) return null;
+    const w = withdrawalSnap.data();
+    if (w.status === 'completed') return w;
+    if (w.status === 'failed') return null;
+
+    const userWalletRef = walletRef.doc(w.userId);
+    const walletSnap = await tx.get(userWalletRef);
+    const current = walletSnap.exists ? walletSnap.data() : { balance: 0, totalEarned: 0, totalWithdrawn: 0 };
+    const txSnap = await txQuery.get();
+
+    tx.update(withdrawalRef, {
+      status: 'completed',
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      providerResponseTimeout: true,
+      failureReason: null,
+      rawWebhook: JSON.stringify(rawPayload || {}).slice(0, 3000),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    tx.set(userWalletRef, {
+      totalWithdrawn: (current.totalWithdrawn || 0) + w.amountRequested,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    if (!txSnap.empty) {
+      tx.update(txSnap.docs[0].ref, {
+        status: 'completed',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    return w;
+  });
+
+  if (result) {
+    await db.collection('userNotifications').add({
+      userId: result.userId,
+      type: 'withdrawalCompleted',
+      message: `UGX ${result.amountSent.toLocaleString()} sent to ${result.phone}. Withdrawal complete.`,
+      link: 'wallet.html',
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  }
+  return !!result;
+}
 
 // Refunds a reserved withdrawal back into the seller's wallet balance and
 // marks both the autoWithdrawals doc and its ledger row as failed. Used
@@ -1624,26 +2090,44 @@ async function applyWithdrawalStatus(marzpayTxId, status, rawPayload) {
   return true;
 }
 
-async function pollMarzpayWithdrawalStatus(withdrawalDocId, txId) {
-  const maxAttempts = 25;
+async function pollMarzpayWithdrawalStatus(withdrawalDocId, txId, reference) {
+  const maxAttempts = 40; // up to ~6 minutes, with webhooks as the primary path
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(r => setTimeout(r, 6000));
     try {
-      const statusRes = await fetch(`${MARZPAY_BASE_URL}/send-money/${txId}`, {
+      const identifier = txId || reference;
+      if (!identifier) return;
+      // MarzPay documents transaction lookup by UUID/reference and returns the
+      // same webhook-shaped transaction object. This lets us recover even when
+      // the initial send-money POST timed out before returning its UUID.
+      const endpoint = txId
+        ? `${MARZPAY_BASE_URL}/send-money/${encodeURIComponent(txId)}`
+        : `${MARZPAY_BASE_URL}/transactions/${encodeURIComponent(reference)}`;
+      const statusRes = await fetchWithTimeout(endpoint, {
         headers: { 'Authorization': marzpayAuthHeader() }
-      });
+      }, 15000);
       if (!statusRes.ok) continue;
       const statusData = await statusRes.json();
-      const status = extractStatus(statusData);
-      if (status === 'completed' || status === 'failed') {
-        await applyWithdrawalStatus(txId, status, statusData);
+      const tx = statusData?.transaction || statusData?.data?.transaction || null;
+      const statusRaw = tx?.status;
+      const status = typeof statusRaw === 'string' ? statusRaw.toLowerCase() : '';
+      const resolvedTxId = tx?.uuid || txId || null;
+      if (resolvedTxId && !txId) {
+        await db.collection('autoWithdrawals').doc(withdrawalDocId).update({ marzpayTransactionId: resolvedTxId, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+      if (status === 'completed' || status === 'successful' || status === 'success') {
+        await applyWithdrawalStatus(resolvedTxId, 'completed', statusData);
+        return;
+      }
+      if (status === 'failed' || status === 'cancelled' || status === 'canceled') {
+        await applyWithdrawalStatus(resolvedTxId, 'failed', statusData);
         return;
       }
     } catch (e) {
       console.error('[poll-withdraw] attempt error:', e.message);
     }
   }
-  console.warn('[poll-withdraw] gave up waiting for transaction', txId);
+  console.warn('[poll-withdraw] still pending after polling window', withdrawalDocId);
 }
 
 // GET /api/admin/wallet-settings — public read of the current withdrawal
