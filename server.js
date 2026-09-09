@@ -1591,9 +1591,27 @@ async function activateDealFromPayment(payment) {
 
 
 async function pollMarzpayStatus(paymentDocId, txId) {
-  const maxAttempts = 25;
+  // MarzPay's own webhook (see the /marzpay-webhook route above) is the
+  // authoritative source of truth for a transaction reaching completed/
+  // failed — it fires whenever MarzPay finishes, independent of this
+  // poller, and order.html watches the order doc live via onSnapshot, so a
+  // buyer who stays on the page sees the result the moment the webhook
+  // lands even if this poller has already given up. This poller exists
+  // only as a backstop for the (much less common) case where the webhook
+  // never arrives — e.g. dropped delivery, misconfigured webhook URL.
+  //
+  // MarzPay's own collection responses have shown estimated_settlement
+  // times of 4-5 minutes out from initiation (seen in production logs:
+  // initiated 11:34:12, estimated_settlement 11:39:12 — a ~5 minute gap),
+  // so a ~2.5 minute window (25 x 6s) gives up before MarzPay is typically
+  // even done, producing "gave up waiting" log noise for transactions that
+  // go on to complete normally via the webhook seconds later. Widening to
+  // 60 attempts x 8s = 8 minutes covers that typical settlement window with
+  // margin, while still eventually stopping rather than polling forever.
+  const maxAttempts = 60;
+  const intervalMs = 8000;
   for (let i = 0; i < maxAttempts; i++) {
-    await new Promise(r => setTimeout(r, 6000));
+    await new Promise(r => setTimeout(r, intervalMs));
     try {
       const statusRes = await fetch(`${MARZPAY_BASE_URL}/transactions/${txId}`, {
         headers: { 'Authorization': marzpayAuthHeader() }
@@ -1609,7 +1627,11 @@ async function pollMarzpayStatus(paymentDocId, txId) {
       console.error('[poll] attempt error:', e.message);
     }
   }
-  console.warn('[poll] gave up waiting for transaction', txId);
+  // Stopping here does NOT mean the payment failed or is stuck — it only
+  // means this poller is no longer checking. The order/payment docs are
+  // left exactly as they were (paymentStatus: 'pending'), and the webhook
+  // can still arrive and complete them at any point after this log line.
+  console.warn('[poll] gave up after', maxAttempts * intervalMs / 1000, 'seconds for transaction', txId, '— order left pending; webhook may still complete it later');
 }
 
 // ─────────────────────────────────────────────────────────────────────────
