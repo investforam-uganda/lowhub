@@ -232,6 +232,204 @@ app.get('/', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// SEO — server-rendered listing pages for Google + link previews
+// ─────────────────────────────────────────────────────────────────────────
+// product.html is a client-side-rendered SPA shell (empty <title>, no real
+// content until Firestore data loads in the browser). Search engine crawlers
+// and link-preview bots (WhatsApp, Facebook, X, Slack) either don't run JS
+// at all, or run it unreliably/slowly, so they mostly see a blank page —
+// meaning a specific user's listing can never surface as its own result on
+// Google, and shared links show no title/image/price preview.
+//
+// This route fixes that by rendering real HTML server-side, straight from
+// Firestore, for exactly one URL per listing: GET /listing/:id
+//   - <title>, meta description, Open Graph + Twitter Card tags, and a
+//     Product/Offer JSON-LD block are all filled in with real data BEFORE
+//     the response leaves this server — no JS execution required to see them.
+//   - A human visitor's browser is redirected (via a tiny inline script,
+//     plus a <meta http-equiv="refresh"> fallback for JS-disabled browsers)
+//     straight into the existing product.html?id=... SPA, so real users still
+//     get the full interactive experience. Bots that don't execute JS simply
+//     never run the redirect and are left with the content above.
+//   - Unapproved / removed / missing listings get a plain noindex page
+//     instead of a fake "product" result, so Google never indexes something
+//     that isn't live.
+//
+// Point real listing links at this route (WhatsApp/Facebook shares, the
+// sitemap, etc.) instead of product.html?id=... directly — internal in-app
+// navigation can keep using product.html?id=... unchanged, since SEO/link
+// previews don't matter for taps that happen inside the app.
+const LISTING_SITE_URL = (process.env.PUBLIC_SITE_URL || 'https://lowhub.store').replace(/\/+$/, '');
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, m => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]
+  ));
+}
+
+function noIndexListingPage(res, status, message) {
+  res.status(status).send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="robots" content="noindex">
+<title>Listing not available – LowHub</title>
+</head><body>
+<p>${escapeHtml(message)}</p>
+<p><a href="${LISTING_SITE_URL}/index.html">Browse LowHub listings</a></p>
+</body></html>`);
+}
+
+app.get('/listing/:id', async (req, res) => {
+  if (!db) return noIndexListingPage(res, 500, 'Listing service is temporarily unavailable.');
+
+  const id = req.params.id;
+  let doc;
+  try {
+    doc = await db.collection('listings').doc(id).get();
+  } catch (e) {
+    console.error('[listing-seo] Firestore read failed:', e.message);
+    return noIndexListingPage(res, 500, 'Listing service is temporarily unavailable.');
+  }
+
+  if (!doc.exists) return noIndexListingPage(res, 404, 'This listing no longer exists.');
+
+  const p = doc.data();
+
+  // Only approved, live listings get indexed. Anything pending/rejected/
+  // expired/inactive is real data but not something Google should ever
+  // show as a result a shopper can actually buy.
+  if (p.status !== 'approved') {
+    return noIndexListingPage(res, 404, 'This listing is not currently available.');
+  }
+
+  const title = p.title || 'Listing';
+  const price = typeof p.price === 'number' ? p.price : null;
+  const description = (p.description && String(p.description).trim())
+    || `${title}${p.location ? ' in ' + p.location : ''} — available on LowHub.`;
+  const image = Array.isArray(p.imageUrls) && p.imageUrls[0] ? p.imageUrls[0] : `${LISTING_SITE_URL}/icon.png`;
+  const pageUrl = `${LISTING_SITE_URL}/listing/${encodeURIComponent(id)}`;
+  const appUrl = `product.html?id=${encodeURIComponent(id)}`;
+  const pageTitle = `${title}${p.location ? ' for Sale in ' + p.location : ' for Sale'} | LowHub`;
+
+  // Availability: LowHub listings are single items (not multi-quantity
+  // retail stock), so "approved and not yet marked sold" = InStock.
+  const availability = p.soldOut === true
+    ? 'https://schema.org/OutOfStock'
+    : 'https://schema.org/InStock';
+  const itemCondition = /new/i.test(p.condition || '')
+    ? 'https://schema.org/NewCondition'
+    : 'https://schema.org/UsedCondition';
+
+  const jsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'Product',
+    name: title,
+    image: [image],
+    description: description,
+    ...(p.category ? { category: p.category } : {}),
+    offers: {
+      '@type': 'Offer',
+      url: pageUrl,
+      priceCurrency: 'UGX',
+      ...(price != null ? { price: String(price) } : {}),
+      availability,
+      itemCondition,
+      ...(p.location ? {
+        areaServed: {
+          '@type': 'Place',
+          name: p.location
+        }
+      } : {})
+    }
+  };
+
+  const priceLine = price != null ? `UGX ${price.toLocaleString('en-US')}` : '';
+
+  res.set('Cache-Control', 'public, max-age=300, s-maxage=3600');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(pageTitle)}</title>
+<meta name="description" content="${escapeHtml(description)}">
+<link rel="canonical" href="${escapeHtml(pageUrl)}">
+
+<meta property="og:type" content="product">
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:image" content="${escapeHtml(image)}">
+<meta property="og:url" content="${escapeHtml(pageUrl)}">
+<meta property="og:site_name" content="LowHub">
+${price != null ? `<meta property="product:price:amount" content="${price}">
+<meta property="product:price:currency" content="UGX">` : ''}
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${escapeHtml(title)}">
+<meta name="twitter:description" content="${escapeHtml(description)}">
+<meta name="twitter:image" content="${escapeHtml(image)}">
+
+<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g, '\\u003c')}</script>
+
+<meta http-equiv="refresh" content="0; url=${escapeHtml(appUrl)}">
+<script>location.replace(${JSON.stringify(appUrl)});</script>
+</head>
+<body>
+<h1>${escapeHtml(title)}</h1>
+${priceLine ? `<p>${escapeHtml(priceLine)}</p>` : ''}
+<p>${escapeHtml(description)}</p>
+<p><img src="${escapeHtml(image)}" alt="${escapeHtml(title)}" style="max-width:100%"></p>
+<p><a href="${escapeHtml(appUrl)}">View full listing on LowHub</a></p>
+</body>
+</html>`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// SEO — dynamic sitemap.xml, generated from live approved listings
+// ─────────────────────────────────────────────────────────────────────────
+// The static sitemap.xml shipped with the frontend only lists fixed pages
+// (home, login, etc.) — it has no way to know about listings created after
+// deploy. This route regenerates the sitemap from Firestore on every
+// request (cached for a few minutes via Cache-Control) so newly posted ads
+// get picked up automatically. Point Google Search Console at
+// {backend URL}/sitemap.xml instead of the static frontend file.
+app.get('/sitemap.xml', async (req, res) => {
+  const staticUrls = [
+    '', 'index.html', 'login.html', 'signup.html', 'post-ad.html',
+    'premium.html', 'privacy.html', 'report-problem.html'
+  ];
+
+  let listingUrls = [];
+  if (db) {
+    try {
+      const snap = await db.collection('listings')
+        .where('status', '==', 'approved')
+        .select('updatedAt', 'createdAt')
+        .limit(5000)
+        .get();
+      listingUrls = snap.docs.map(d => {
+        const data = d.data();
+        const ts = data.updatedAt || data.createdAt;
+        const lastmod = ts && ts.toDate ? ts.toDate().toISOString().slice(0, 10) : null;
+        return { loc: `${LISTING_SITE_URL}/listing/${d.id}`, lastmod };
+      });
+    } catch (e) {
+      console.error('[sitemap] Firestore read failed:', e.message);
+      // Fall through and still serve the static URLs below rather than
+      // failing the whole sitemap over a transient Firestore error.
+    }
+  }
+
+  const xmlEntries = [
+    ...staticUrls.map(u => `  <url><loc>${LISTING_SITE_URL}/${u}</loc></url>`),
+    ...listingUrls.map(u => `  <url><loc>${escapeHtml(u.loc)}</loc>${u.lastmod ? `<lastmod>${u.lastmod}</lastmod>` : ''}</url>`)
+  ].join('\n');
+
+  res.set('Content-Type', 'application/xml');
+  res.set('Cache-Control', 'public, max-age=1800');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${xmlEntries}\n</urlset>`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // 0. ORDERS — creation, pricing, stock reservation, negotiation, status
 // ─────────────────────────────────────────────────────────────────────────
 // This section is entirely NEW (marketplace/order upgrade). It sits ahead
