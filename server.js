@@ -100,51 +100,32 @@ const admin = require('firebase-admin');
 const fetch = global.fetch || require('node-fetch');
 const crypto = require('crypto');
 
-// ── Firebase Admin init ─────────────────────────────────────────────────
-// Uses a single FIREBASE_SERVICE_ACCOUNT env var holding the entire
-// service-account JSON as one string, parsed with JSON.parse(). This is
-// deliberately NOT split into separate FIREBASE_PROJECT_ID /
-// FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY env vars — that approach
-// requires manually converting the private key's real newlines to literal
-// \n sequences and back, and it only takes one dropped character or one
-// "helpful" editor reformat during paste to corrupt the PEM structure and
-// trigger "error:1E08010C:DECODER routines::unsupported" from OpenSSL.
-// JSON.parse() on the whole file avoids that entirely — it interprets the
-// \n escapes inside the JSON string correctly by construction, giving
-// Node the exact byte-for-byte key Firebase generated.
-function initFirebaseAdmin() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-
-  if (!raw) {
-    console.error('[startup] Missing FIREBASE_SERVICE_ACCOUNT env var.');
-    console.error('[startup] The server will start, but every Firebase-dependent route will fail until this is set in Render.');
-    return null;
-  }
-
-  let serviceAccount;
-  try {
-    serviceAccount = JSON.parse(raw);
-  } catch (e) {
-    console.error('[startup] FIREBASE_SERVICE_ACCOUNT is not valid JSON:', e.message);
-    console.error('[startup] Paste the ENTIRE contents of your downloaded service-account JSON file as-is, as one line, into this env var.');
-    return null;
-  }
-
-  if (!serviceAccount.project_id || !serviceAccount.client_email || !serviceAccount.private_key) {
-    console.error('[startup] FIREBASE_SERVICE_ACCOUNT JSON is missing project_id, client_email, or private_key.');
-    return null;
-  }
-
-  console.log(`[startup] FIREBASE_SERVICE_ACCOUNT parsed OK — project_id=${serviceAccount.project_id}, client_email=${serviceAccount.client_email}`);
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  return admin.firestore();
+// Firebase Admin is retained only for Auth verification and FCM notifications.
+function initFirebaseAdmin(){
+ const raw=process.env.FIREBASE_SERVICE_ACCOUNT;
+ if(!raw){console.error('[startup] Missing FIREBASE_SERVICE_ACCOUNT');return false}
+ try{const sa=JSON.parse(raw);if(!admin.apps.length)admin.initializeApp({credential:admin.credential.cert(sa)});return true}
+ catch(e){console.error('[startup] Firebase Admin init failed:',e.message);return false}
 }
+const firebaseReady=initFirebaseAdmin();
 
-const db = initFirebaseAdmin();
+const {createClient}=require('@supabase/supabase-js');
+const SUPABASE_URL=process.env.SUPABASE_URL||'https://gfwbflcohigltrcgimdp.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY=process.env.SUPABASE_SERVICE_ROLE_KEY||'';
+const sb=SUPABASE_SERVICE_ROLE_KEY?createClient(SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,{auth:{persistSession:false}}):null;
+const TABLES={pendingPush:'pending_push',pushTokens:'push_tokens',userNotifications:'user_notifications',userNotificationAccess:'user_notification_access',siteConfig:'site_config',walletTransactions:'wallet_transactions',autoPayments:'auto_payments',autoWithdrawals:'auto_withdrawals',premiumPlans:'premium_plans',premiumRequests:'premium_requests',dealRequests:'deal_requests',orderEvents:'order_events',orderNegotiations:'order_negotiations',deliveryAgents:'delivery_agents',deliveryZones:'delivery_zones',pickupStations:'pickup_stations',adminNotifications:'admin_notifications',pageViews:'page_views',popinAds:'popin_ads',aiModerationStatus:'ai_moderation_status'};
+const tn=c=>TABLES[c]||c.replace(/[A-Z]/g,m=>'_'+m.toLowerCase()), cn=k=>({userId:'user_id',sellerId:'seller_id',buyerId:'buyer_id',listingId:'listing_id',orderId:'order_id',orderNumber:'order_number',createdAt:'created_at',updatedAt:'updated_at',senderId:'sender_id',receiverId:'receiver_id',userName:'user_name',userEmail:'user_email',photoURL:'photo_url',withdrawalId:'withdrawal_id',transactionRef:'transaction_ref',idempotencyKey:'idempotency_key'}[k]||k.replace(/[A-Z]/g,m=>'_'+m.toLowerCase()));
+const enc=v=>v&&v.__lhServerTimestamp?new Date().toISOString():v&&typeof v.toDate==='function'?v.toDate().toISOString():v;
+const pack=o=>{let r={};for(const[k,v]of Object.entries(o||{}))r[cn(k)]=enc(v);return r};
+const unpack=r=>{if(!r)return null;let o={...(r.data||{})};for(const[k,v]of Object.entries(r))if(k!=='data')o[k]=v;for(const[k,v]of Object.entries(o))if(k.includes('_'))o[k.replace(/_([a-z])/g,(_,x)=>x.toUpperCase())]??=v;return o};
+class Snap{constructor(r,ref){this.r=r;this.id=r?.id;this.exists=!!r;this.ref=ref}data(){return unpack(this.r)}}
+class QS{constructor(rows,table){this.docs=rows.map(r=>new Snap(r,new Ref(table,r.id)));this.empty=!this.docs.length;this.size=this.docs.length}forEach(f){this.docs.forEach(f)}}
+class Ref{constructor(t,id){this.t=t;this.id=id}collection(s){return new Collection(s==='negotiations'?'orderNegotiations':s)}async get(){let{data,error}=await sb.from(this.t).select('*').eq('id',this.id).maybeSingle();if(error)throw error;return new Snap(data,this)}async set(o,opt={}){if(opt.merge)return this.update(o);let p=pack(o);p.id=this.id;let{data,error}=await sb.from(this.t).upsert(p).select().single();if(error)throw error;return new Snap(data,this)}async update(o){let p=pack(o);delete p.id;let{data,error}=await sb.from(this.t).update(p).eq('id',this.id).select().single();if(error)throw error;return new Snap(data,this)}async delete(){let{error}=await sb.from(this.t).delete().eq('id',this.id);if(error)throw error}}
+class Collection{constructor(c){this.t=tn(c);this.fs=[];this.os=[];this.lm=null;this.sel='*'}doc(id){return new Ref(this.t,id)}where(f,o,v){this.fs.push([cn(f),o,enc(v)]);return this}orderBy(f,d='asc'){this.os.push([cn(f),d]);return this}limit(n){this.lm=n;return this}select(...f){if(f.length)this.sel=f.flat().map(cn).join(',');return this}async get(){let q=sb.from(this.t).select(this.sel);for(let[f,o,v]of this.fs){if(o==='==')q=q.eq(f,v);else if(o==='!=')q=q.neq(f,v);else if(o==='>')q=q.gt(f,v);else if(o==='>=')q=q.gte(f,v);else if(o==='<')q=q.lt(f,v);else if(o==='<=' )q=q.lte(f,v);else if(o==='in')q=q.in(f,v)}for(let[f,d]of this.os)q=q.order(f,{ascending:d!=='desc'});if(this.lm)q=q.limit(this.lm);let{data,error}=await q;if(error)throw error;return new QS(data||[],this.t)}async add(o){let id=crypto.randomUUID(),p=pack(o);p.id=id;let{data,error}=await sb.from(this.t).insert(p).select().single();if(error)throw error;return new Snap(data,new Ref(this.t,id))}}
+const db={collection:c=>new Collection(c),batch:()=>{let a=[];return{set:(r,o,p)=>a.push(()=>r.set(o,p)),update:(r,o)=>a.push(()=>r.update(o)),delete:r=>a.push(()=>r.delete()),commit:()=>Promise.all(a.map(x=>x()))}},runTransaction:async fn=>{let a=[];const t={get:r=>r.get(),set:(r,o,p)=>a.push(()=>r.set(o,p)),update:(r,o)=>a.push(()=>r.update(o)),delete:r=>a.push(()=>r.delete())};let r=await fn(t);await Promise.all(a.map(x=>x()));return r}};
+function requireDb(res){if(!sb){res.status(500).json({success:false,error:'Missing SUPABASE_SERVICE_ROLE_KEY'});return false}return true}
 
+admin.firestore=admin.firestore||{}; admin.firestore.FieldValue={serverTimestamp:()=>({__lhServerTimestamp:true}),increment:n=>({__lhIncrement:n}),arrayUnion:(...v)=>({__lhArrayUnion:v}),arrayRemove:(...v)=>({__lhArrayRemove:v})};
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -2560,7 +2541,26 @@ app.post('/api/notifications/toggle-free-channel', requireAuth, async (req, res)
     await db.collection('userNotificationAccess').doc(req.authUid).set({
       [channel]: { active: !!on, source: 'user-free-toggle', updatedAt: admin.firestore.FieldValue.serverTimestamp() }
     }, { merge: true });
-    res.json({ success: true });
+
+    // Keep a visible in-app record of the user's subscription choice. It is
+    // marked outboundProcessed so the subscription confirmation itself is
+    // not sent again through the newly-enabled channel and cannot create a
+    // notification loop. The actual subscription remains in
+    // userNotificationAccess/{uid}, which survives admin logout/reload.
+    await db.collection('userNotifications').add({
+      userId: req.authUid,
+      type: on ? 'notifChannelSubscribed' : 'notifChannelUnsubscribed',
+      title: on ? 'Notifications Subscribed' : 'Notifications Unsubscribed',
+      message: on
+        ? `${channel.charAt(0).toUpperCase() + channel.slice(1)} notifications are now subscribed on your account.`
+        : `${channel.charAt(0).toUpperCase() + channel.slice(1)} notifications have been unsubscribed on your account.`,
+      link: 'notification-settings.html',
+      read: false,
+      outboundProcessed: true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, subscribed: !!on, channel });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
