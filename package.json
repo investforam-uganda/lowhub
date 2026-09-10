@@ -1,17 +1,17 @@
 {
-  "name": "lowhub-backend",
+  "name": "lowhub",
   "version": "1.0.0",
-  "description": "LowHub backend — MarzPay automatic payments + real FCM push delivery",
-  "main": "server.js",
+  "private": true,
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "@supabase/supabase-js": "^2.57.0",
     "cors": "^2.8.5",
+    "express": "^4.19.2",
     "firebase-admin": "^12.1.0",
     "node-fetch": "^2.7.0"
   }
