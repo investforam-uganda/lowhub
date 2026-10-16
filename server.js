@@ -232,6 +232,71 @@ app.get('/', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// AUTH BOT GUARD (built-in — no external service, no API keys)
+// ─────────────────────────────────────────────────────────────────────────
+// login.html and signup.html POST here immediately before calling Firebase
+// Auth. It validates the two invisible signals those pages collect (a hidden
+// honeypot field real users never see, and the minimum time spent on the
+// page) and then applies a per-IP rate limit. The rate-limit state lives here
+// on the server, so — unlike a purely client-side check — a caller cannot
+// reset it just by clearing browser storage or reloading.
+//
+// IMPORTANT LIMITATION: Firebase Authentication is called directly from the
+// browser (browser → Google's servers), so this endpoint cannot
+// cryptographically *force* a client to ask permission first. It therefore
+// fails OPEN (returns ok:true) on any internal error, so a Render cold start
+// or outage can never lock real users out of signing in. To hard-block
+// automated account creation you need Firebase App Check, or to route signup
+// through this server via admin.auth().createUser().
+const _authGuardHits = new Map(); // bucket -> { start, count }
+function _authGuardIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+function _authGuardRateLimited(bucket, limit, windowMs) {
+  const now = Date.now();
+  let entry = _authGuardHits.get(bucket);
+  if (!entry || now - entry.start > windowMs) {
+    entry = { start: now, count: 0 };
+    _authGuardHits.set(bucket, entry);
+  }
+  entry.count += 1;
+  // Opportunistic cleanup so the map can't grow without bound.
+  if (_authGuardHits.size > 5000) {
+    for (const [k, v] of _authGuardHits) { if (now - v.start > windowMs) _authGuardHits.delete(k); }
+  }
+  return entry.count > limit;
+}
+app.post('/api/auth/guard', (req, res) => {
+  try {
+    const body   = req.body || {};
+    const action = body.action === 'signup' ? 'signup' : 'login';
+
+    // Honeypot: a hidden field real users never see or fill; bots do.
+    if (typeof body.hp === 'string' && body.hp.trim() !== '') {
+      return res.json({ ok: false, reason: 'challenge' });
+    }
+    // Minimum time-on-page: an instant submit means a script, not a person.
+    const elapsed = Number(body.elapsed);
+    if (!Number.isFinite(elapsed) || elapsed < 1200) {
+      return res.json({ ok: false, reason: 'challenge' });
+    }
+    // Per-IP rate limit. Login is deliberately generous (shared NAT/office
+    // networks would otherwise be punished); signup, which is what account
+    // spammers abuse, is tighter.
+    const limit    = action === 'signup' ? 8 : 40;
+    const windowMs = 10 * 60 * 1000;
+    if (_authGuardRateLimited(action + ':' + _authGuardIp(req), limit, windowMs)) {
+      return res.json({ ok: false, reason: 'rate_limited' });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    // A bug in the guard must never block sign-in.
+    return res.json({ ok: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // SEO — server-rendered listing pages for Google + link previews
 // ─────────────────────────────────────────────────────────────────────────
 // product.html is a client-side-rendered SPA shell (empty <title>, no real
@@ -2560,26 +2625,7 @@ app.post('/api/notifications/toggle-free-channel', requireAuth, async (req, res)
     await db.collection('userNotificationAccess').doc(req.authUid).set({
       [channel]: { active: !!on, source: 'user-free-toggle', updatedAt: admin.firestore.FieldValue.serverTimestamp() }
     }, { merge: true });
-
-    // Keep a visible in-app record of the user's subscription choice. It is
-    // marked outboundProcessed so the subscription confirmation itself is
-    // not sent again through the newly-enabled channel and cannot create a
-    // notification loop. The actual subscription remains in
-    // userNotificationAccess/{uid}, which survives admin logout/reload.
-    await db.collection('userNotifications').add({
-      userId: req.authUid,
-      type: on ? 'notifChannelSubscribed' : 'notifChannelUnsubscribed',
-      title: on ? 'Notifications Subscribed' : 'Notifications Unsubscribed',
-      message: on
-        ? `${channel.charAt(0).toUpperCase() + channel.slice(1)} notifications are now subscribed on your account.`
-        : `${channel.charAt(0).toUpperCase() + channel.slice(1)} notifications have been unsubscribed on your account.`,
-      link: 'notification-settings.html',
-      read: false,
-      outboundProcessed: true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({ success: true, subscribed: !!on, channel });
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
